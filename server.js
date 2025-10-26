@@ -6,7 +6,11 @@ console.log('Booting server.js ...');
 const express = require('express');
 const bodyParser = require('body-parser');
 const fetch = require('node-fetch'); // v2.x in package.json!
-const { Issuer } = require('openid-client');
+const OpenID = require('openid-client');
+const { Issuer } = OpenID;
+if (!Issuer || typeof Issuer.discover !== 'function') {
+  console.error('openid-client Importproblem: Issuer.discover fehlt');
+}
 const fs = require('fs');
 
 const app = express();
@@ -191,4 +195,5 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 // ---------- start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
