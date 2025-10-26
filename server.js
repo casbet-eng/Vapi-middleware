@@ -44,22 +44,37 @@ function requireVapiSecret(req, res, next) {
 }
 
 // ---------- Azure / Microsoft Graph OAuth client ----------
+// ---------- MICROSOFT / AZURE OAUTH SETUP ----------
 let azureClient;
-async function initAzure() {
-  if (!process.env.AZ_TENANT_ID || !process.env.AZ_CLIENT_ID || !process.env.AZ_CLIENT_SECRET || !process.env.AZ_REDIRECT_URI) {
-    console.warn('Azure ENV Variablen fehlen. Setze AZ_TENANT_ID, AZ_CLIENT_ID, AZ_CLIENT_SECRET, AZ_REDIRECT_URI');
-    return;
+
+(async function initAzure() {
+  try {
+    // ENV prüfen (sonst abbrechen)
+    if (!process.env.AZ_TENANT_ID || !process.env.AZ_CLIENT_ID || !process.env.AZ_CLIENT_SECRET || !process.env.AZ_REDIRECT_URI) {
+      console.warn('Azure ENV Variablen fehlen. Setze AZ_TENANT_ID, AZ_CLIENT_ID, AZ_CLIENT_SECRET, AZ_REDIRECT_URI');
+      return;
+    }
+
+    // Dynamischer Import – funktioniert sicher in CommonJS
+    const { Issuer } = await import('openid-client');
+    if (!Issuer || typeof Issuer.discover !== 'function') {
+      console.error('openid-client Importproblem: Issuer.discover fehlt');
+      return;
+    }
+
+    const msIssuer = await Issuer.discover(`https://login.microsoftonline.com/${process.env.AZ_TENANT_ID}/v2.0`);
+    azureClient = new msIssuer.Client({
+      client_id: process.env.AZ_CLIENT_ID,
+      client_secret: process.env.AZ_CLIENT_SECRET,
+      redirect_uris: [process.env.AZ_REDIRECT_URI],
+      response_types: ['code']
+    });
+
+    console.log('Azure OIDC client initialisiert.');
+  } catch (e) {
+    console.error('Azure init error', e);
   }
-  const issuer = await Issuer.discover(`https://login.microsoftonline.com/${process.env.AZ_TENANT_ID}/v2.0`);
-  azureClient = new issuer.Client({
-    client_id: process.env.AZ_CLIENT_ID,
-    client_secret: process.env.AZ_CLIENT_SECRET,
-    redirect_uris: [process.env.AZ_REDIRECT_URI],
-    response_types: ['code']
-  });
-  console.log('Azure OIDC client initialisiert.');
-}
-initAzure().catch(e => console.error('Azure init error', e));
+})();
 
 const SCOPES = ['offline_access', 'Calendars.ReadWrite'];
 
@@ -195,5 +210,6 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 // ---------- start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
