@@ -10,6 +10,6 @@
     "body-parser": "^1.20.3",
     "dotenv": "^16.4.5",
     "node-fetch": "2.6.12",
-    "openid-client": "^6.1.5"
+   "openid-client": "^5.4.0"
   }
 }
