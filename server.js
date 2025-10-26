@@ -1,11 +1,14 @@
 // server.js — Outlook-only Vapi Middleware
 require('dotenv').config();
+
 process.on('unhandledRejection', (e) => { console.error('UNHANDLED REJECTION', e); });
-process.on('uncaughtException', (e) => { console.error('UNCAUGHT EXCEPTION', e); });
+process.on('uncaughtException',  (e) => { console.error('UNCAUGHT EXCEPTION', e); });
+
 console.log('Booting server.js ...');
+
 const express = require('express');
 const bodyParser = require('body-parser');
-const fetch = require('node-fetch'); // v2.x in package.json!
+const fetch = require('node-fetch');           // v2.x in package.json!
 const { Issuer } = require('openid-client');
 const fs = require('fs');
 
@@ -14,17 +17,21 @@ app.use(bodyParser.json());
 
 // ---------- simple JSON token store (multi-tenant) ----------
 const TOKENS_PATH = process.env.TOKENS_PATH || './tokens.json';
+
 function readStore() {
   try { return JSON.parse(fs.readFileSync(TOKENS_PATH, 'utf8')); }
   catch { return {}; }
 }
+
 function writeStore(obj) {
   fs.writeFileSync(TOKENS_PATH, JSON.stringify(obj, null, 2));
 }
+
 function getTenant(tenantId) {
   const store = readStore();
   return store[tenantId] || null;
 }
+
 function upsertTenant(tenantId, data) {
   const store = readStore();
   store[tenantId] = { ...(store[tenantId] || {}), ...data };
@@ -40,12 +47,11 @@ function requireVapiSecret(req, res, next) {
 }
 
 // ---------- Azure / Microsoft Graph OAuth client ----------
-// ---------- MICROSOFT / AZURE OAUTH SETUP ----------
 let azureClient;
+const SCOPES = ['offline_access', 'Calendars.ReadWrite'];
 
 (async function initAzure() {
   try {
-    // ENV prüfen (sonst abbrechen)
     if (!process.env.AZ_TENANT_ID || !process.env.AZ_CLIENT_ID || !process.env.AZ_CLIENT_SECRET || !process.env.AZ_REDIRECT_URI) {
       console.warn('Azure ENV Variablen fehlen. Setze AZ_TENANT_ID, AZ_CLIENT_ID, AZ_CLIENT_SECRET, AZ_REDIRECT_URI');
       return;
@@ -56,7 +62,7 @@ let azureClient;
       client_id: process.env.AZ_CLIENT_ID,
       client_secret: process.env.AZ_CLIENT_SECRET,
       redirect_uris: [process.env.AZ_REDIRECT_URI],
-      response_types: ['code']
+      response_types: ['code'],
     });
 
     console.log('Azure OIDC client initialisiert.');
@@ -65,48 +71,56 @@ let azureClient;
   }
 })();
 
-const SCOPES = ['offline_access', 'Calendars.ReadWrite'];
-
 // ---------- OAuth routes ----------
+app.get('/auth/azure', async (req, res) => {
+  try {
+    if (!azureClient) return res.status(500).send('Azure nicht konfiguriert.');
+    const tenantId = req.query.tenant || 'default';
+
+    const url = azureClient.authorizationUrl({
+      scope: SCOPES.join(' '),
+      response_mode: 'query',
+      state: tenantId, // wir nutzen tenantId als state
+    });
+
+    console.log('[OAUTH] auth start -> state:', tenantId);
+    res.redirect(url);
+  } catch (e) {
+    console.error('Auth start error', e);
+    res.status(500).send('Auth start error');
+  }
+});
+
 app.get('/auth/azure/callback', async (req, res) => {
   try {
+    if (!azureClient) return res.status(500).send('Azure nicht konfiguriert.');
+
     const params = azureClient.callbackParams(req);
+    console.log('[OAUTH] callback params:', params);
+
+    // Falls Azure keinen state zurückschickt, fallback auf 'default'
     const expectedState = params.state || req.query.state || 'default';
+    console.log('[OAUTH] callback we pass state:', expectedState);
 
-
+    // state MUSS explizit übergeben werden, sonst wirft openid-client "checks.state argument is missing"
     const tokenSet = await azureClient.callback(
       process.env.AZ_REDIRECT_URI,
       params,
       { state: expectedState }
     );
 
+    console.log('[OAUTH] tokenSet:', {
+      hasAccess: !!tokenSet.access_token,
+      hasRefresh: !!tokenSet.refresh_token,
+      scope: tokenSet.scope,
+    });
+
     upsertTenant(expectedState, {
       type: 'azure',
       access_token: tokenSet.access_token,
       refresh_token: tokenSet.refresh_token,
       scope: tokenSet.scope,
-      expires_at: tokenSet.expires_at || (Date.now() + 45 * 60 * 1000)
-    });
-
-    res.send('Microsoft Outlook verbunden. Du kannst dieses Fenster schließen.');
-  } catch (e) {
-    console.error('Azure callback error', e);
-    res.status(500).send('Azure callback error');
-  }
-});
-
-app.get('/auth/azure/callback', async (req, res) => {
-  try {
-    const params = azureClient.callbackParams(req);
-    const tenantId = params.state || 'default';
-    const tokenSet = await azureClient.callback(process.env.AZ_REDIRECT_URI, params);
-
-    upsertTenant(tenantId, {
-      type: 'azure',
-      access_token: tokenSet.access_token,
-      refresh_token: tokenSet.refresh_token,
-      scope: tokenSet.scope,
-      expires_at: tokenSet.expires_at || (Date.now() + 45 * 60 * 1000)
+      expires_at: tokenSet.expires_at || (Date.now() + 45 * 60 * 1000),
     });
 
     res.send('Microsoft Outlook verbunden. Du kannst dieses Fenster schließen.');
@@ -119,7 +133,9 @@ app.get('/auth/azure/callback', async (req, res) => {
 // ---------- token refresh ----------
 async function ensureAzureAccessToken(tenantId) {
   const t = getTenant(tenantId);
-  if (!t || t.type !== 'azure' || !t.refresh_token) throw new Error('Kein Outlook-Konto verbunden');
+  if (!t || t.type !== 'azure' || !t.refresh_token) {
+    throw new Error('Kein Outlook-Konto verbunden');
+  }
 
   // Refresh wenn abgelaufen/kurz davor
   if (!t.expires_at || Date.now() > (t.expires_at - 60 * 1000)) {
@@ -136,12 +152,14 @@ async function ensureAzureAccessToken(tenantId) {
     if (!resp.ok || data.error) {
       throw new Error(`Token refresh failed: ${resp.status} ${JSON.stringify(data)}`);
     }
+
     upsertTenant(tenantId, {
       access_token: data.access_token,
       refresh_token: data.refresh_token || t.refresh_token,
-      expires_at: Date.now() + (data.expires_in * 1000)
+      expires_at: Date.now() + (data.expires_in * 1000),
     });
   }
+
   return getTenant(tenantId).access_token;
 }
 
@@ -163,7 +181,7 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
     const timezone = data.timezone || 'Europe/Zurich';
     const duration = Number(data.durationMinutes || 30);
 
-    if (intent === 'check_availability' || intent === 'create_appointment') {
+    if (intent === 'check_availability' || intent === 'create_appointment')) {
       const token = await ensureAzureAccessToken(tenantId);
       const { start, end } = parseTimeslot(data.date, data.time, duration);
       const startISO = start.toISOString();
@@ -183,14 +201,16 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
           subject: `Besichtigung: ${data.property_id || 'Objekt'}`,
           body: { contentType: 'HTML', content: `Kontakt: ${data.customer_name || ''} ${data.phone || meta.caller_number || ''} ${data.email || ''}` },
           start: { dateTime: startISO, timeZone: timezone },
-          end: { dateTime: endISO, timeZone: timezone },
+          end:   { dateTime: endISO,  timeZone: timezone },
           attendees: data.email ? [{ emailAddress: { address: data.email, name: data.customer_name || '' }, type: 'required' }] : []
         };
+
         const r = await fetch(createUrl, {
           method: 'POST',
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
           body: JSON.stringify(event)
         });
+
         const created = await r.json();
         if (!r.ok) return res.status(400).json({ ok: false, error: created });
         return res.json({ ok: true, created });
@@ -207,9 +227,24 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
 // ---------- health ----------
 app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 
+// ---------- route list for debugging ----------
+function logRoutes(app) {
+  const routes = [];
+  (app._router?.stack || []).forEach((layer) => {
+    if (layer.route && layer.route.path) {
+      const method = Object.keys(layer.route.methods)[0]?.toUpperCase();
+      routes.push(`${method} ${layer.route.path}`);
+    }
+  });
+  console.log('[ROUTES]', routes);
+}
+logRoutes(app);
+
 // ---------- start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
+
 
 
 
