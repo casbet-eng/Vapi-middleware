@@ -51,13 +51,6 @@ let azureClient;
       return;
     }
 
-    // Dynamischer Import – funktioniert sicher in CommonJS
-    const { Issuer } = await import('openid-client');
-    if (!Issuer || typeof Issuer.discover !== 'function') {
-      console.error('openid-client Importproblem: Issuer.discover fehlt');
-      return;
-    }
-
     const msIssuer = await Issuer.discover(`https://login.microsoftonline.com/${process.env.AZ_TENANT_ID}/v2.0`);
     azureClient = new msIssuer.Client({
       client_id: process.env.AZ_CLIENT_ID,
@@ -75,19 +68,30 @@ let azureClient;
 const SCOPES = ['offline_access', 'Calendars.ReadWrite'];
 
 // ---------- OAuth routes ----------
-app.get('/auth/azure', async (req, res) => {
+app.get('/auth/azure/callback', async (req, res) => {
   try {
-    if (!azureClient) return res.status(500).send('Azure nicht konfiguriert.');
-    const tenantId = req.query.tenant || 'default';
-    const url = azureClient.authorizationUrl({
-      scope: SCOPES.join(' '),
-      response_mode: 'query',
-      state: tenantId
+    const params = azureClient.callbackParams(req);
+    const expectedState = params.state || req.query.state || 'default';
+
+
+    const tokenSet = await azureClient.callback(
+      process.env.AZ_REDIRECT_URI,
+      params,
+      { state: expectedState }
+    );
+
+    upsertTenant(expectedState, {
+      type: 'azure',
+      access_token: tokenSet.access_token,
+      refresh_token: tokenSet.refresh_token,
+      scope: tokenSet.scope,
+      expires_at: tokenSet.expires_at || (Date.now() + 45 * 60 * 1000)
     });
-    res.redirect(url);
+
+    res.send('Microsoft Outlook verbunden. Du kannst dieses Fenster schließen.');
   } catch (e) {
-    console.error(e);
-    res.status(500).send('Auth start error');
+    console.error('Azure callback error', e);
+    res.status(500).send('Azure callback error');
   }
 });
 
@@ -206,6 +210,7 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 // ---------- start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
 
