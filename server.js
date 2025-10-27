@@ -48,7 +48,7 @@ function requireVapiSecret(req, res, next) {
 
 // ---------- Azure / Microsoft Graph OAuth client ----------
 let azureClient;
-const SCOPES = ['offline_access', 'Calendars.ReadWrite'];
+const SCOPES = ['offline_access', 'openid', 'profile', 'email', 'Calendars.ReadWrite'];
 
 (async function initAzure() {
   try {
@@ -243,6 +243,7 @@ logRoutes(app);
 // ---------- start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
 
