@@ -136,6 +136,27 @@ async function ensureAzureAccessToken(tenantId) {
   if (!t || t.type !== 'azure' || !t.refresh_token) {
     throw new Error('Kein Outlook-Konto verbunden');
   }
+  
+  if (!t.access_token) {
+  const tokenUrl = `https://login.microsoftonline.com/${process.env.AZ_TENANT_ID}/oauth2/v2.0/token`;
+  const params = new URLSearchParams();
+  params.append('client_id', process.env.AZ_CLIENT_ID);
+  params.append('client_secret', process.env.AZ_CLIENT_SECRET);
+  params.append('grant_type', 'refresh_token');
+  params.append('refresh_token', t.refresh_token);
+  params.append('scope', SCOPES.join(' '));
+
+  const resp = await fetch(tokenUrl, { method: 'POST', body: params });
+  const data = await resp.json();
+  if (!resp.ok || data.error)
+    throw new Error(`Token refresh failed: ${resp.status} ${JSON.stringify(data)}`);
+
+  upsertTenant(tenantId, {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token || t.refresh_token,
+    expires_at: Date.now() + (data.expires_in * 1000)
+  });
+}
 
   // Refresh wenn abgelaufen/kurz davor
   if (!t.expires_at || Date.now() > (t.expires_at - 60 * 1000)) {
@@ -289,6 +310,7 @@ logRoutes(app);
 // ---------- start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
 
