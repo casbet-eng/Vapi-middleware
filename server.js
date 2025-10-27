@@ -181,7 +181,7 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
     const timezone = data.timezone || 'Europe/Zurich';
     const duration = Number(data.durationMinutes || 30);
 
-    if (intent === 'check_availability' || intent === 'create_appointment')) {
+    if (intent === 'check_availability' || intent === 'create_appointment') {
       const token = await ensureAzureAccessToken(tenantId);
       const { start, end } = parseTimeslot(data.date, data.time, duration);
       const startISO = start.toISOString();
@@ -243,6 +243,7 @@ logRoutes(app);
 // ---------- start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
 
