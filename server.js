@@ -237,15 +237,29 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
           attendees: data.email ? [{ emailAddress: { address: data.email, name: data.customer_name || '' }, type: 'required' }] : []
         };
 
-        const r = await fetch(createUrl, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify(event)
-        });
+const r = await fetch(createUrl, {
+  method: 'POST',
+  headers: {
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+    Prefer: `outlook.timezone="${timezone}"`
+  },
+  body: JSON.stringify(event)
+});
 
-        const created = await r.json();
-        if (!r.ok) return res.status(400).json({ ok: false, error: created });
-        return res.json({ ok: true, created });
+const raw = await r.text();
+let created = null;
+try { created = raw ? JSON.parse(raw) : null; } catch { /* ignore */ }
+
+if (!r.ok)
+  return res.status(r.status).json({
+    ok: false,
+    error: created || raw || 'graph_create_error',
+    status: r.status
+  });
+
+return res.json({ ok: true, created });
       }
     }
 
@@ -275,6 +289,7 @@ logRoutes(app);
 // ---------- start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
 
