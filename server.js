@@ -187,13 +187,45 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
       const startISO = start.toISOString();
       const endISO = end.toISOString();
 
-      if (intent === 'check_availability') {
-        const q = `https://graph.microsoft.com/v1.0/me/calendarView?startDateTime=${encodeURIComponent(startISO)}&endDateTime=${encodeURIComponent(endISO)}`;
-        const r = await fetch(q, { headers: { Authorization: `Bearer ${token}` } });
-        const body = await r.json();
-        const isBusy = Array.isArray(body.value) && body.value.length > 0;
-        return res.json({ ok: true, available: !isBusy, events: body.value || [] });
-      }
+     if (intent === 'check_availability') {
+  const q = `https://graph.microsoft.com/v1.0/me/calendarView` +
+            `?startDateTime=${encodeURIComponent(startISO)}` +
+            `&endDateTime=${encodeURIComponent(endISO)}` +
+            `&$top=50&$select=subject,organizer,start,end`;
+
+  const r = await fetch(q, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/json',
+      Prefer: `outlook.timezone="${timezone}"`
+    }
+  });
+
+  const raw = await r.text();
+  let body = null;
+  try {
+    body = raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return res.status(r.status || 500).json({
+      ok: false,
+      error: 'graph_non_json_response',
+      status: r.status,
+      preview: raw?.slice(0, 500)
+    });
+  }
+
+  if (!r.ok) {
+    return res.status(r.status).json({
+      ok: false,
+      error: body?.error || body || 'graph_error',
+      status: r.status
+    });
+  }
+
+  const events = Array.isArray(body.value) ? body.value : [];
+  const isBusy = events.length > 0;
+  return res.json({ ok: true, available: !isBusy, events });
+}
 
       if (intent === 'create_appointment') {
         const createUrl = 'https://graph.microsoft.com/v1.0/me/events';
@@ -243,6 +275,7 @@ logRoutes(app);
 // ---------- start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
 
