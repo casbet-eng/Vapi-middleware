@@ -204,24 +204,23 @@ app.get('/debug/calendar', async (req, res) => {
 // ---------- Vapi webhook ----------
 app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
   try {
-    // 1) Intent aus Header/Body lesen (Fallback-Kette)
-    let intent =
-      req.body?.intent ||
-      req.get('x-vapi-intent') ||
-      req.body?.name ||
-      null;
+    // 0) Rohdaten kurz loggen
+    const bodyKeys = Object.keys(req.body || {});
+    const headerIntent = (req.get('x-vapi-intent') || '').trim();
+    const bodyIntent   = req.body?.intent ? String(req.body.intent).trim() : '';
+    let intent         = headerIntent || bodyIntent || null;
 
-    // 2) Daten normalisieren – akzeptiere mehrere Vapi-Formate
-    let data = req.body?.data || {};
+    // 1) Daten normalisieren
+    let data = req.body?.data && typeof req.body.data === 'object' ? req.body.data : {};
 
-    // a) Falls Vapi nur { message: {...} } schickt
+    // a) Falls Vapi etwas wie { message: {...} } schickt
     if (!Object.keys(data).length && req.body?.message) {
       const m = req.body.message;
       data = m?.input || m?.arguments || m || {};
-      if (!intent) intent = m?.tool || m?.name || intent;
+      if (!intent) intent = m?.tool || m?.name || null;
     }
 
-    // b) Falls Vapi "flat" sendet (Parameter auf Top-Level)
+    // b) Falls flache Struktur (Parameter oben)
     if (!Object.keys(data).length) {
       const { intent: _i, data: _d, message: _m, ...maybeFlat } = req.body || {};
       if (maybeFlat.date || maybeFlat.time || maybeFlat.timezone || maybeFlat.tenant) {
@@ -229,17 +228,30 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
       }
     }
 
-    // 3) Defaults
-    if (!intent) intent = 'check_availability'; // Fallback
+    // 2) EARLY EXIT: Nicht-Tool-Events ignorieren
+    const looksLikeToolPayload =
+      (data.date && data.time && (data.timezone || req.body?.timezone)) ||
+      !!intent; // Intent per Header reicht uns als Signal
+
+    if (!looksLikeToolPayload) {
+      console.log('[WEBHOOK] ignore non-tool event, keys:', bodyKeys);
+      return res.status(204).end(); // leise ignorieren
+    }
+
+    // 3) Ab hier nur noch echte Tool-Calls
+    console.log('[WEBHOOK] tool-call intent=', intent, 'keys=', Object.keys(data || {}));
+
+    // Defaults
     const tenantId = (data.tenant || 'default').toLowerCase();
     const timezone = data.timezone || 'Europe/Zurich';
     const duration = Number(data.durationMinutes || 30);
 
-    // 4) Pflichtfelder prüfen (nur für die beiden Intents)
+    // Pflichtfelder prüfen (nur für die beiden Intents)
     if ((intent === 'check_availability' || intent === 'create_appointment') &&
         (!data.date || !data.time || !timezone)) {
-      // [LOG] fehlende Felder
-      console.log('[WEBHOOK] missing_fields', { intent, need: ['date','time','timezone'], got: Object.keys(data || {}) });
+      console.log('[WEBHOOK] missing_fields', {
+        intent, need: ['date','time','timezone'], got: Object.keys(data || {})
+      });
       return res.status(400).json({
         ok: false,
         error: 'missing_fields',
@@ -248,15 +260,13 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
       });
     }
 
-    console.log('[WEBHOOK] intent:', intent, ', keys:', Object.keys(data || {}));
-
-    // Vorbereitungen für Graph-Calls (Token + Zeitfenster)
+    // Token & Zeitfenster
     const token = await ensureAzureAccessToken(tenantId);
     const { start, end } = parseTimeslot(data.date, data.time, duration);
     const startISO = start.toISOString();
     const endISO   = end.toISOString();
 
-    // --- 3) Check Availability ---
+    // --- check_availability ---
     if (intent === 'check_availability') {
       const q =
         `https://graph.microsoft.com/v1.0/me/calendarView` +
@@ -276,7 +286,6 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
       let body = null;
       try { body = raw ? JSON.parse(raw) : null; }
       catch {
-        // [LOG] Graph liefert kein JSON
         console.log('[WEBHOOK] graph_non_json_response (check_availability)', r.status, (raw || '').slice(0, 300));
         return res.status(r.status || 500).json({
           ok: false,
@@ -287,7 +296,6 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
       }
 
       if (!r.ok) {
-        // [LOG] Graph-Fehler vor dem Return
         console.log('[WEBHOOK] graph error (check_availability)', r.status, (raw || '').slice(0, 300));
         return res.status(r.status).json({
           ok: false,
@@ -298,13 +306,11 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
 
       const events = Array.isArray(body.value) ? body.value : [];
       const available = events.length === 0;
-
-      // [LOG] Erfolg direkt vor dem Return
-      console.log('[WEBHOOK] responding ok (check_availability)', { available, count: events.length, startISO, endISO });
+      console.log('[WEBHOOK] responding ok (check_availability)', { available, count: events.length });
       return res.json({ ok: true, available, events });
     }
 
-    // --- 4) Create Appointment ---
+    // --- create_appointment ---
     if (intent === 'create_appointment') {
       const createUrl = 'https://graph.microsoft.com/v1.0/me/events';
       const event = {
@@ -320,7 +326,7 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
           : []
       };
 
-      const r = await reqFetch(createUrl, { // falls du oben 'fetch' importierst, dann hier wieder 'fetch' statt 'reqFetch'
+      const r = await fetch(createUrl, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,
@@ -336,7 +342,6 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
       try { created = raw ? JSON.parse(raw) : null; } catch {}
 
       if (!r.ok) {
-        // [LOG] Graph-Fehler vor dem Return
         console.log('[WEBHOOK] graph error (create_appointment)', r.status, (raw || '').slice(0, 300));
         return res.status(r.status).json({
           ok: false,
@@ -345,22 +350,20 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
         });
       }
 
-      // [LOG] Erfolg direkt vor dem Return
-      console.log('[WEBHOOK] responding ok (create_appointment)', { eventId: created?.id, startISO, endISO });
+      console.log('[WEBHOOK] responding ok (create_appointment)', { id: created?.id });
       return res.json({ ok: true, created });
     }
 
-    // --- 5) Fallback ---
-    // [LOG] Unbekannter Intent vor dem Return
-    console.log('[WEBHOOK] intent_not_supported', { intent, keys: Object.keys(data || {}) });
+    // Fallback
+    console.log('[WEBHOOK] intent_not_supported', { intent });
     return res.json({ ok: false, error: 'intent_not_supported' });
 
   } catch (e) {
-    // [LOG] Unerwartete Ausnahme
     console.error('Webhook error', e);
     return res.status(500).json({ ok: false, error: e.message || String(e) });
   }
 });
+
 
 // ---------- health ----------
 app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
@@ -381,6 +384,7 @@ logRoutes(app);
 // ---------- start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
 
