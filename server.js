@@ -22,23 +22,15 @@ function readStore() {
   try { return JSON.parse(fs.readFileSync(TOKENS_PATH, 'utf8')); }
   catch { return {}; }
 }
-
-function writeStore(obj) {
-  fs.writeFileSync(TOKENS_PATH, JSON.stringify(obj, null, 2));
-}
-
-function getTenant(tenantId) {
-  const store = readStore();
-  return store[tenantId] || null;
-}
-
+function writeStore(obj) { fs.writeFileSync(TOKENS_PATH, JSON.stringify(obj, null, 2)); }
+function getTenant(tenantId) { const store = readStore(); return store[tenantId] || null; }
 function upsertTenant(tenantId, data) {
   const store = readStore();
   store[tenantId] = { ...(store[tenantId] || {}), ...data };
   writeStore(store);
 }
 
-// Optional: simple auth for incoming webhooks (set VAPI_SECRET in Render)
+// ---------- optional webhook auth ----------
 function requireVapiSecret(req, res, next) {
   if (!process.env.VAPI_SECRET) return next();
   const header = req.get('x-vapi-secret');
@@ -48,7 +40,17 @@ function requireVapiSecret(req, res, next) {
 
 // ---------- Azure / Microsoft Graph OAuth client ----------
 let azureClient;
-const SCOPES = ['offline_access', 'openid', 'profile', 'email', 'Calendars.ReadWrite'];
+
+// Vollständiges Scope-Set (wichtig für Graph)
+const SCOPES = [
+  'offline_access',
+  'Calendars.Read',
+  'Calendars.ReadWrite',
+  'User.Read',
+  'openid',
+  'profile',
+  'email'
+];
 
 (async function initAzure() {
   try {
@@ -56,7 +58,6 @@ const SCOPES = ['offline_access', 'openid', 'profile', 'email', 'Calendars.ReadW
       console.warn('Azure ENV Variablen fehlen. Setze AZ_TENANT_ID, AZ_CLIENT_ID, AZ_CLIENT_SECRET, AZ_REDIRECT_URI');
       return;
     }
-
     const msIssuer = await Issuer.discover(`https://login.microsoftonline.com/${process.env.AZ_TENANT_ID}/v2.0`);
     azureClient = new msIssuer.Client({
       client_id: process.env.AZ_CLIENT_ID,
@@ -64,11 +65,8 @@ const SCOPES = ['offline_access', 'openid', 'profile', 'email', 'Calendars.ReadW
       redirect_uris: [process.env.AZ_REDIRECT_URI],
       response_types: ['code'],
     });
-
     console.log('Azure OIDC client initialisiert.');
-  } catch (e) {
-    console.error('Azure init error', e);
-  }
+  } catch (e) { console.error('Azure init error', e); }
 })();
 
 // ---------- OAuth routes ----------
@@ -76,39 +74,24 @@ app.get('/auth/azure', async (req, res) => {
   try {
     if (!azureClient) return res.status(500).send('Azure nicht konfiguriert.');
     const tenantId = req.query.tenant || 'default';
-
     const url = azureClient.authorizationUrl({
       scope: SCOPES.join(' '),
       response_mode: 'query',
-      state: tenantId, // wir nutzen tenantId als state
+      state: tenantId,
     });
-
     console.log('[OAUTH] auth start -> state:', tenantId);
     res.redirect(url);
-  } catch (e) {
-    console.error('Auth start error', e);
-    res.status(500).send('Auth start error');
-  }
+  } catch (e) { console.error('Auth start error', e); res.status(500).send('Auth start error'); }
 });
 
 app.get('/auth/azure/callback', async (req, res) => {
   try {
     if (!azureClient) return res.status(500).send('Azure nicht konfiguriert.');
-
     const params = azureClient.callbackParams(req);
-    console.log('[OAUTH] callback params:', params);
-
-    // Falls Azure keinen state zurückschickt, fallback auf 'default'
     const expectedState = params.state || req.query.state || 'default';
-    console.log('[OAUTH] callback we pass state:', expectedState);
+    console.log('[OAUTH] callback state:', expectedState);
 
-    // state MUSS explizit übergeben werden, sonst wirft openid-client "checks.state argument is missing"
-    const tokenSet = await azureClient.callback(
-      process.env.AZ_REDIRECT_URI,
-      params,
-      { state: expectedState }
-    );
-
+    const tokenSet = await azureClient.callback(process.env.AZ_REDIRECT_URI, params, { state: expectedState });
     console.log('[OAUTH] tokenSet:', {
       hasAccess: !!tokenSet.access_token,
       hasRefresh: !!tokenSet.refresh_token,
@@ -124,10 +107,7 @@ app.get('/auth/azure/callback', async (req, res) => {
     });
 
     res.send('Microsoft Outlook verbunden. Du kannst dieses Fenster schließen.');
-  } catch (e) {
-    console.error('Azure callback error', e);
-    res.status(500).send('Azure callback error');
-  }
+  } catch (e) { console.error('Azure callback error', e); res.status(500).send('Azure callback error'); }
 });
 
 // ---------- token refresh ----------
@@ -136,52 +116,43 @@ async function ensureAzureAccessToken(tenantId) {
   if (!t || t.type !== 'azure' || !t.refresh_token) {
     throw new Error('Kein Outlook-Konto verbunden');
   }
-  
-  if (!t.access_token) {
-  const tokenUrl = `https://login.microsoftonline.com/${process.env.AZ_TENANT_ID}/oauth2/v2.0/token`;
-  const params = new URLSearchParams();
-  params.append('client_id', process.env.AZ_CLIENT_ID);
-  params.append('client_secret', process.env.AZ_CLIENT_SECRET);
-  params.append('grant_type', 'refresh_token');
-  params.append('refresh_token', t.refresh_token);
-  params.append('scope', SCOPES.join(' '));
 
-  const resp = await fetch(tokenUrl, { method: 'POST', body: params });
-  const data = await resp.json();
-  if (!resp.ok || data.error)
-    throw new Error(`Token refresh failed: ${resp.status} ${JSON.stringify(data)}`);
-
-  upsertTenant(tenantId, {
-    access_token: data.access_token,
-    refresh_token: data.refresh_token || t.refresh_token,
-    expires_at: Date.now() + (data.expires_in * 1000)
-  });
-}
-
-  // Refresh wenn abgelaufen/kurz davor
-  if (!t.expires_at || Date.now() > (t.expires_at - 60 * 1000)) {
+  // Refresh-Weg als Funktion (inkl. Raw-Logging)
+  async function refreshWith(refreshToken) {
     const tokenUrl = `https://login.microsoftonline.com/${process.env.AZ_TENANT_ID}/oauth2/v2.0/token`;
     const params = new URLSearchParams();
     params.append('client_id', process.env.AZ_CLIENT_ID);
     params.append('client_secret', process.env.AZ_CLIENT_SECRET);
     params.append('grant_type', 'refresh_token');
-    params.append('refresh_token', t.refresh_token);
-    params.append('scope', SCOPES.join(' '));
+    params.append('refresh_token', refreshToken);
+    params.append('scope', SCOPES.join(' ')); // v2.0: Scopes immer als Leerzeichenliste
 
     const resp = await fetch(tokenUrl, { method: 'POST', body: params });
-    const data = await resp.json();
+    const raw = await resp.text();
+    let data; try { data = JSON.parse(raw); } catch { data = { parseError:true, raw }; }
+
     if (!resp.ok || data.error) {
       throw new Error(`Token refresh failed: ${resp.status} ${JSON.stringify(data)}`);
     }
-
     upsertTenant(tenantId, {
       access_token: data.access_token,
-      refresh_token: data.refresh_token || t.refresh_token,
+      refresh_token: data.refresh_token || refreshToken,
       expires_at: Date.now() + (data.expires_in * 1000),
     });
+    return data.access_token;
   }
 
-  return getTenant(tenantId).access_token;
+  // Falls kein Access-Token (Edge-Case)
+  if (!t.access_token) {
+    return await refreshWith(t.refresh_token);
+  }
+
+  // Wenn abgelaufen/kurz davor -> refresh
+  if (!t.expires_at || Date.now() > (t.expires_at - 60 * 1000)) {
+    return await refreshWith(t.refresh_token);
+  }
+
+  return t.access_token;
 }
 
 // ---------- helpers ----------
@@ -191,6 +162,44 @@ function parseTimeslot(dateStr, timeStr, durationMin = 30) {
   const end = new Date(start.getTime() + durationMin * 60 * 1000);
   return { start, end };
 }
+
+// ---------- DEBUG ROUTES ----------
+app.get('/debug/me', async (req, res) => {
+  try {
+    const tenantId = req.query.tenant || 'default';
+    const token = await ensureAzureAccessToken(tenantId);
+    const r = await fetch('https://graph.microsoft.com/v1.0/me', {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
+    });
+    const raw = await r.text();
+    let body; try { body = JSON.parse(raw); } catch { body = { parseError:true, raw }; }
+    res.status(r.ok ? 200 : 400).json({ ok:r.ok, status:r.status, body });
+  } catch (e) { res.status(500).json({ ok:false, error:String(e) }); }
+});
+
+app.get('/debug/calendar', async (req, res) => {
+  try {
+    const tenantId = req.query.tenant || 'default';
+    const date = req.query.date;
+    const time = req.query.time;
+    const duration = Number(req.query.dur || 30);
+    const token = await ensureAzureAccessToken(tenantId);
+
+    const { start, end } = parseTimeslot(date, time, duration);
+    const q = `https://graph.microsoft.com/v1.0/me/calendarView?startDateTime=${encodeURIComponent(start.toISOString())}&endDateTime=${encodeURIComponent(end.toISOString())}`;
+
+    const r = await fetch(q, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/json',
+        Prefer: `outlook.timezone="${req.query.tz || 'Europe/Zurich'}"`
+      }
+    });
+    const raw = await r.text();
+    let body; try { body = JSON.parse(raw); } catch { body = { parseError:true, raw }; }
+    res.status(r.ok ? 200 : 400).json({ ok:r.ok, status:r.status, body });
+  } catch (e) { res.status(500).json({ ok:false, error:String(e) }); }
+});
 
 // ---------- Vapi webhook ----------
 app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
@@ -208,45 +217,43 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
       const startISO = start.toISOString();
       const endISO = end.toISOString();
 
-     if (intent === 'check_availability') {
-  const q = `https://graph.microsoft.com/v1.0/me/calendarView` +
-            `?startDateTime=${encodeURIComponent(startISO)}` +
-            `&endDateTime=${encodeURIComponent(endISO)}` +
-            `&$top=50&$select=subject,organizer,start,end`;
+      if (intent === 'check_availability') {
+        const q = `https://graph.microsoft.com/v1.0/me/calendarView` +
+                  `?startDateTime=${encodeURIComponent(startISO)}` +
+                  `&endDateTime=${encodeURIComponent(endISO)}` +
+                  `&$top=50&$select=subject,organizer,start,end`;
 
-  const r = await fetch(q, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/json',
-      Prefer: `outlook.timezone="${timezone}"`
-    }
-  });
+        const r = await fetch(q, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: 'application/json',
+            Prefer: `outlook.timezone="${timezone}"`
+          }
+        });
 
-  const raw = await r.text();
-  let body = null;
-  try {
-    body = raw ? JSON.parse(raw) : null;
-  } catch (e) {
-    return res.status(r.status || 500).json({
-      ok: false,
-      error: 'graph_non_json_response',
-      status: r.status,
-      preview: raw?.slice(0, 500)
-    });
-  }
+        const raw = await r.text();
+        let body = null;
+        try { body = raw ? JSON.parse(raw) : null; } catch {
+          return res.status(r.status || 500).json({
+            ok: false,
+            error: 'graph_non_json_response',
+            status: r.status,
+            preview: raw?.slice(0, 500)
+          });
+        }
 
-  if (!r.ok) {
-    return res.status(r.status).json({
-      ok: false,
-      error: body?.error || body || 'graph_error',
-      status: r.status
-    });
-  }
+        if (!r.ok) {
+          return res.status(r.status).json({
+            ok: false,
+            error: body?.error || body || 'graph_error',
+            status: r.status
+          });
+        }
 
-  const events = Array.isArray(body.value) ? body.value : [];
-  const isBusy = events.length > 0;
-  return res.json({ ok: true, available: !isBusy, events });
-}
+        const events = Array.isArray(body.value) ? body.value : [];
+        const isBusy = events.length > 0;
+        return res.json({ ok: true, available: !isBusy, events });
+      }
 
       if (intent === 'create_appointment') {
         const createUrl = 'https://graph.microsoft.com/v1.0/me/events';
@@ -258,29 +265,29 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
           attendees: data.email ? [{ emailAddress: { address: data.email, name: data.customer_name || '' }, type: 'required' }] : []
         };
 
-const r = await fetch(createUrl, {
-  method: 'POST',
-  headers: {
-    Authorization: `Bearer ${token}`,
-    'Content-Type': 'application/json',
-    Accept: 'application/json',
-    Prefer: `outlook.timezone="${timezone}"`
-  },
-  body: JSON.stringify(event)
-});
+        const r = await fetch(createUrl, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            Prefer: `outlook.timezone="${timezone}"`
+          },
+          body: JSON.stringify(event)
+        });
 
-const raw = await r.text();
-let created = null;
-try { created = raw ? JSON.parse(raw) : null; } catch { /* ignore */ }
+        const raw = await r.text();
+        let created = null;
+        try { created = raw ? JSON.parse(raw) : null; } catch { /* ignore */ }
 
-if (!r.ok)
-  return res.status(r.status).json({
-    ok: false,
-    error: created || raw || 'graph_create_error',
-    status: r.status
-  });
-
-return res.json({ ok: true, created });
+        if (!r.ok) {
+          return res.status(r.status).json({
+            ok: false,
+            error: created || raw || 'graph_create_error',
+            status: r.status
+          });
+        }
+        return res.json({ ok: true, created });
       }
     }
 
@@ -310,15 +317,3 @@ logRoutes(app);
 // ---------- start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
-
-
-
-
-
-
-
-
-
-
-
-
