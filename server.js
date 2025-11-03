@@ -201,94 +201,126 @@ app.get('/debug/calendar', async (req, res) => {
   } catch (e) { res.status(500).json({ ok:false, error:String(e) }); }
 });
 
-// ---------- Vapi webhook ----------
+// ---------- Vapi webhook (robust: Header-Intent + flache Parameter unterstützt) ----------
 app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
   try {
-    const { intent, data = {}, meta = {} } = req.body || {};
-    if (!intent) return res.status(400).json({ ok: false, error: 'intent missing' });
+    // 1) Intent aus Body ODER Header ODER heuristisch ableiten
+    let intent = (req.body && req.body.intent) || req.get('x-vapi-intent') || null;
 
-    const tenantId = data.tenant || 'default';
+    // Vapi schickt oft flache Parameter direkt im Body:
+    const b = req.body || {};
+    const data = b.data || b; // wenn kein data-Wrapper existiert, flachen Body nutzen
+    const meta = b.meta || {};
+
+    // Falls kein Intent angegeben ist: heuristisch entscheiden
+    if (!intent) {
+      if (typeof data?.appointment_type === 'string' || data?.email || data?.customer_name) {
+        intent = 'create_appointment';
+      } else if (data?.date && data?.time) {
+        intent = 'check_availability';
+      }
+    }
+
+    if (!intent) {
+      return res.status(400).json({ ok: false, error: 'intent missing' });
+    }
+
+    // 2) Eingaben normalisieren
+    const tenantId = (data.tenant || 'default').toString();
     const timezone = data.timezone || 'Europe/Zurich';
+
+    // duration als Number normalisieren (Vapi liefert evtl. als String)
     const duration = Number(data.durationMinutes || 30);
 
-    if (intent === 'check_availability' || intent === 'create_appointment') {
-      const token = await ensureAzureAccessToken(tenantId);
+    // 3) Access Token sicherstellen
+    const token = await ensureAzureAccessToken(tenantId);
+
+    // 4) Datums-/Zeitfenster berechnen (nur wenn date/time vorhanden)
+    let startISO, endISO;
+    if (data.date && data.time) {
       const { start, end } = parseTimeslot(data.date, data.time, duration);
-      const startISO = start.toISOString();
-      const endISO = end.toISOString();
+      startISO = start.toISOString();
+      endISO = end.toISOString();
+    }
 
-      if (intent === 'check_availability') {
-        const q = `https://graph.microsoft.com/v1.0/me/calendarView` +
-                  `?startDateTime=${encodeURIComponent(startISO)}` +
-                  `&endDateTime=${encodeURIComponent(endISO)}` +
-                  `&$top=50&$select=subject,organizer,start,end`;
-
-        const r = await fetch(q, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            Accept: 'application/json',
-            Prefer: `outlook.timezone="${timezone}"`
-          }
-        });
-
-        const raw = await r.text();
-        let body = null;
-        try { body = raw ? JSON.parse(raw) : null; } catch {
-          return res.status(r.status || 500).json({
-            ok: false,
-            error: 'graph_non_json_response',
-            status: r.status,
-            preview: raw?.slice(0, 500)
-          });
-        }
-
-        if (!r.ok) {
-          return res.status(r.status).json({
-            ok: false,
-            error: body?.error || body || 'graph_error',
-            status: r.status
-          });
-        }
-
-        const events = Array.isArray(body.value) ? body.value : [];
-        const isBusy = events.length > 0;
-        return res.json({ ok: true, available: !isBusy, events });
+    // 5) Intent-Handling
+    if (intent === 'check_availability') {
+      if (!startISO || !endISO) {
+        return res.status(400).json({ ok: false, error: 'date/time required' });
       }
 
-      if (intent === 'create_appointment') {
-        const createUrl = 'https://graph.microsoft.com/v1.0/me/events';
-        const event = {
-          subject: `Besichtigung: ${data.property_id || 'Objekt'}`,
-          body: { contentType: 'HTML', content: `Kontakt: ${data.customer_name || ''} ${data.phone || meta.caller_number || ''} ${data.email || ''}` },
-          start: { dateTime: startISO, timeZone: timezone },
-          end:   { dateTime: endISO,  timeZone: timezone },
-          attendees: data.email ? [{ emailAddress: { address: data.email, name: data.customer_name || '' }, type: 'required' }] : []
-        };
+      const q = `https://graph.microsoft.com/v1.0/me/calendarView` +
+                `?startDateTime=${encodeURIComponent(startISO)}` +
+                `&endDateTime=${encodeURIComponent(endISO)}` +
+                `&$top=50&$select=subject,organizer,start,end`;
 
-        const r = await fetch(createUrl, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-            Prefer: `outlook.timezone="${timezone}"`
-          },
-          body: JSON.stringify(event)
-        });
-
-        const raw = await r.text();
-        let created = null;
-        try { created = raw ? JSON.parse(raw) : null; } catch { /* ignore */ }
-
-        if (!r.ok) {
-          return res.status(r.status).json({
-            ok: false,
-            error: created || raw || 'graph_create_error',
-            status: r.status
-          });
+      const r = await fetch(q, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json',
+          Prefer: `outlook.timezone="${timezone}"`
         }
-        return res.json({ ok: true, created });
+      });
+
+      const raw = await r.text();
+      let body = null;
+      try { body = raw ? JSON.parse(raw) : null; } catch (_) {
+        return res.status(r.status || 500).json({
+          ok: false, error: 'graph_non_json_response', status: r.status, preview: raw?.slice(0, 500)
+        });
       }
+
+      if (!r.ok) {
+        return res.status(r.status).json({ ok: false, error: body?.error || body || 'graph_error', status: r.status });
+      }
+
+      const events = Array.isArray(body.value) ? body.value : [];
+      const isBusy = events.length > 0;
+      return res.json({ ok: true, available: !isBusy, events });
+    }
+
+    if (intent === 'create_appointment') {
+      if (!startISO || !endISO) {
+        return res.status(400).json({ ok: false, error: 'date/time required' });
+      }
+
+      const createUrl = 'https://graph.microsoft.com/v1.0/me/events';
+      const event = {
+        subject: `${data.appointment_type || 'Termin'}: ${data.property_id || ''}`.trim(),
+        body: {
+          contentType: 'HTML',
+          content: [
+            data.notes ? `Notizen: ${data.notes}` : null,
+            data.customer_name ? `Name: ${data.customer_name}` : null,
+            (data.phone || meta.caller_number) ? `Telefon: ${data.phone || meta.caller_number}` : null,
+            data.email ? `E-Mail: ${data.email}` : null,
+            data.address ? `Adresse: ${data.address}` : null
+          ].filter(Boolean).join('<br>')
+        },
+        start: { dateTime: startISO, timeZone: timezone },
+        end:   { dateTime: endISO,  timeZone: timezone },
+        attendees: data.email ? [{ emailAddress: { address: data.email, name: data.customer_name || '' }, type: 'required' }] : []
+      };
+
+      const r = await fetch(createUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          Prefer: `outlook.timezone="${timezone}"`
+        },
+        body: JSON.stringify(event)
+      });
+
+      const raw = await r.text();
+      let created = null;
+      try { created = raw ? JSON.parse(raw) : null; } catch { /* ignore */ }
+
+      if (!r.ok) {
+        return res.status(r.status).json({ ok: false, error: created || raw || 'graph_create_error', status: r.status });
+      }
+      return res.json({ ok: true, created });
     }
 
     return res.json({ ok: false, error: 'intent_not_supported' });
@@ -317,3 +349,4 @@ logRoutes(app);
 // ---------- start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
