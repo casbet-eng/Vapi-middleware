@@ -201,59 +201,36 @@ app.get('/debug/calendar', async (req, res) => {
   } catch (e) { res.status(500).json({ ok:false, error:String(e) }); }
 });
 
-// ---------- Vapi webhook (robust: Header-Intent + flache Parameter unterstützt) ----------
+// ---------- Vapi webhook ----------
 app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
   try {
-    // 1) Intent aus Body ODER Header ODER heuristisch ableiten
-    let intent = (req.body && req.body.intent) || req.get('x-vapi-intent') || null;
+    // --- 1) Intent bestimmen (aus Header oder Body)
+    const headerIntent = (req.get('x-vapi-intent') || '').trim();
+    const bodyIntent   = req.body?.intent ? String(req.body.intent).trim() : '';
+    const intent       = headerIntent || bodyIntent;
 
-    // Vapi schickt oft flache Parameter direkt im Body:
-    const b = req.body || {};
-    const data = b.data || b; // wenn kein data-Wrapper existiert, flachen Body nutzen
-    const meta = b.meta || {};
-
-    // Falls kein Intent angegeben ist: heuristisch entscheiden
-    if (!intent) {
-      if (typeof data?.appointment_type === 'string' || data?.email || data?.customer_name) {
-        intent = 'create_appointment';
-      } else if (data?.date && data?.time) {
-        intent = 'check_availability';
-      }
-    }
+    // --- 2) Payload normalisieren (alte oder neue Struktur)
+    const payload = req.body?.data && typeof req.body.data === 'object'
+      ? req.body.data
+      : req.body || {};
 
     if (!intent) {
-      return res.status(400).json({ ok: false, error: 'intent missing' });
+      return res.status(400).json({ ok: false, error: 'intent missing (Header x-vapi-intent oder body.intent erwartet)' });
     }
 
-    // 2) Eingaben normalisieren
-    const tenantId = (data.tenant || 'default').toString();
-    const timezone = data.timezone || 'Europe/Zurich';
+    console.log('[WEBHOOK]', { intent, keys: Object.keys(payload || {}) });
 
-    // duration als Number normalisieren (Vapi liefert evtl. als String)
-    const duration = Number(data.durationMinutes || 30);
-
-    // 3) Access Token sicherstellen
+    const tenantId = payload.tenant || 'default';
+    const timezone = payload.timezone || 'Europe/Zurich';
+    const duration = Number(payload.durationMinutes || 30);
     const token = await ensureAzureAccessToken(tenantId);
+    const { start, end } = parseTimeslot(payload.date, payload.time, duration);
+    const startISO = start.toISOString();
+    const endISO   = end.toISOString();
 
-    // 4) Datums-/Zeitfenster berechnen (nur wenn date/time vorhanden)
-    let startISO, endISO;
-    if (data.date && data.time) {
-      const { start, end } = parseTimeslot(data.date, data.time, duration);
-      startISO = start.toISOString();
-      endISO = end.toISOString();
-    }
-
-    // 5) Intent-Handling
+    // --- 3) Check Availability
     if (intent === 'check_availability') {
-      if (!startISO || !endISO) {
-        return res.status(400).json({ ok: false, error: 'date/time required' });
-      }
-
-      const q = `https://graph.microsoft.com/v1.0/me/calendarView` +
-                `?startDateTime=${encodeURIComponent(startISO)}` +
-                `&endDateTime=${encodeURIComponent(endISO)}` +
-                `&$top=50&$select=subject,organizer,start,end`;
-
+      const q = `https://graph.microsoft.com/v1.0/me/calendarView?startDateTime=${encodeURIComponent(startISO)}&endDateTime=${encodeURIComponent(endISO)}&$top=50&$select=subject,organizer,start,end`;
       const r = await fetch(q, {
         headers: {
           Authorization: `Bearer ${token}`,
@@ -264,14 +241,21 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
 
       const raw = await r.text();
       let body = null;
-      try { body = raw ? JSON.parse(raw) : null; } catch (_) {
+      try { body = raw ? JSON.parse(raw) : null; } catch (e) {
         return res.status(r.status || 500).json({
-          ok: false, error: 'graph_non_json_response', status: r.status, preview: raw?.slice(0, 500)
+          ok: false,
+          error: 'graph_non_json_response',
+          status: r.status,
+          preview: raw?.slice(0, 500)
         });
       }
 
       if (!r.ok) {
-        return res.status(r.status).json({ ok: false, error: body?.error || body || 'graph_error', status: r.status });
+        return res.status(r.status).json({
+          ok: false,
+          error: body?.error || body || 'graph_error',
+          status: r.status
+        });
       }
 
       const events = Array.isArray(body.value) ? body.value : [];
@@ -279,27 +263,15 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
       return res.json({ ok: true, available: !isBusy, events });
     }
 
+    // --- 4) Create Appointment
     if (intent === 'create_appointment') {
-      if (!startISO || !endISO) {
-        return res.status(400).json({ ok: false, error: 'date/time required' });
-      }
-
       const createUrl = 'https://graph.microsoft.com/v1.0/me/events';
       const event = {
-        subject: `${data.appointment_type || 'Termin'}: ${data.property_id || ''}`.trim(),
-        body: {
-          contentType: 'HTML',
-          content: [
-            data.notes ? `Notizen: ${data.notes}` : null,
-            data.customer_name ? `Name: ${data.customer_name}` : null,
-            (data.phone || meta.caller_number) ? `Telefon: ${data.phone || meta.caller_number}` : null,
-            data.email ? `E-Mail: ${data.email}` : null,
-            data.address ? `Adresse: ${data.address}` : null
-          ].filter(Boolean).join('<br>')
-        },
+        subject: `Besichtigung: ${payload.property_id || 'Objekt'}`,
+        body: { contentType: 'HTML', content: `Kontakt: ${payload.customer_name || ''} ${payload.phone || ''} ${payload.email || ''} ${payload.notes || ''}` },
         start: { dateTime: startISO, timeZone: timezone },
         end:   { dateTime: endISO,  timeZone: timezone },
-        attendees: data.email ? [{ emailAddress: { address: data.email, name: data.customer_name || '' }, type: 'required' }] : []
+        attendees: payload.email ? [{ emailAddress: { address: payload.email, name: payload.customer_name || '' }, type: 'required' }] : []
       };
 
       const r = await fetch(createUrl, {
@@ -315,20 +287,28 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
 
       const raw = await r.text();
       let created = null;
-      try { created = raw ? JSON.parse(raw) : null; } catch { /* ignore */ }
+      try { created = raw ? JSON.parse(raw) : null; } catch {}
 
       if (!r.ok) {
-        return res.status(r.status).json({ ok: false, error: created || raw || 'graph_create_error', status: r.status });
+        return res.status(r.status).json({
+          ok: false,
+          error: created || raw || 'graph_create_error',
+          status: r.status
+        });
       }
+
       return res.json({ ok: true, created });
     }
 
+    // --- 5) Fallback
     return res.json({ ok: false, error: 'intent_not_supported' });
+
   } catch (e) {
     console.error('Webhook error', e);
     return res.status(500).json({ ok: false, error: e.message || String(e) });
   }
 });
+
 
 // ---------- health ----------
 app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
@@ -349,4 +329,5 @@ logRoutes(app);
 // ---------- start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
