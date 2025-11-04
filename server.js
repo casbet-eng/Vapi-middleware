@@ -15,6 +15,18 @@ const fs = require('fs');
 const app = express();
 app.use(bodyParser.json());
 
+// ---- CORS: muss VOR den Routen stehen ----
+app.use((req, res, next) => {
+  // Erlaube Zugriffe (z. B. vom Vapi-Dashboard oder Browser-Tests)
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-vapi-secret, x-vapi-intent');
+
+  // Preflight-Anfragen (OPTIONS) direkt beantworten
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 // ---------- simple JSON token store (multi-tenant) ----------
 const TOKENS_PATH = process.env.TOKENS_PATH || './tokens.json';
 
@@ -384,6 +396,7 @@ logRoutes(app);
 // ---------- start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
 
