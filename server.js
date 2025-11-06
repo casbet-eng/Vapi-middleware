@@ -21,7 +21,7 @@ app.use(bodyParser.json());
 // -----------------------------------------
 // Settings & files
 // -----------------------------------------
-const TOKEN_FILE = path.join(__dirname, 'token.json'); // Persistenter Tokenstore (ein Tenant: "default")
+const TOKEN_FILE = path.join(__dirname, 'token.json'); // Persistenter Tokenstore
 const SCOPES = ['offline_access', 'openid', 'profile', 'email', 'Calendars.ReadWrite'];
 
 let azureClient;
@@ -37,7 +37,38 @@ function requireVapiSecret(req, res, next) {
 }
 
 // -----------------------------------------
-// Init Azure OpenID Client
+// Bootstrap: Falls kein token.json -> über ENV refreshen
+// (WICHTIG: erst aufrufen, wenn azureClient gesetzt ist!)
+// -----------------------------------------
+async function bootstrapTokenFromEnvIfNeeded() {
+  try {
+    const hasTokenFile = fs.existsSync(TOKEN_FILE);
+    if (hasTokenFile) {
+      console.log('[BOOT] token.json vorhanden.');
+      return;
+    }
+
+    const envRefresh = process.env.AZ_REFRESH_DEFAULT;
+    if (!envRefresh) {
+      console.log('[BOOT] Kein token.json und keine AZ_REFRESH_DEFAULT ENV gesetzt.');
+      return;
+    }
+    if (!azureClient) {
+      console.log('[BOOT] azureClient noch nicht initialisiert – Bootstrap wird übersprungen.');
+      return;
+    }
+
+    console.log('[BOOT] Kein token.json, refreshe über ENV…');
+    const refreshed = await azureClient.refresh(envRefresh);
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify(refreshed, null, 2));
+    console.log('[BOOT] token.json aus ENV-Refresh erstellt.');
+  } catch (e) {
+    console.error('[BOOT] Fehler beim Laden/Refresh aus ENV:', e);
+  }
+}
+
+// -----------------------------------------
+// Init Azure OpenID Client (ruft Bootstrap NACH Init)
 // -----------------------------------------
 (async function initAzure() {
   try {
@@ -54,39 +85,18 @@ function requireVapiSecret(req, res, next) {
       response_types: ['code'],
     });
     console.log('Azure OIDC client initialisiert.');
+
+    // 👉 WICHTIG: Bootstrap ERST JETZT, wenn azureClient existiert
+    await bootstrapTokenFromEnvIfNeeded();
   } catch (e) {
     console.error('Azure init error', e);
   }
 })();
 
 // -----------------------------------------
-// Bootstrap: Falls kein token.json -> über ENV refreshen
-// -----------------------------------------
-async function bootstrapTokenFromEnvIfNeeded() {
-  try {
-    if (!fs.existsSync(TOKEN_FILE)) {
-      const envRefresh = process.env.AZ_REFRESH_DEFAULT;
-      if (envRefresh && azureClient) {
-        console.log('[BOOT] Kein token.json, refreshe über ENV...');
-        const refreshed = await azureClient.refresh(envRefresh);
-        fs.writeFileSync(TOKEN_FILE, JSON.stringify(refreshed, null, 2));
-        console.log('[BOOT] token.json aus ENV-Refresh erstellt.');
-      } else {
-        console.log('[BOOT] Kein token.json und keine AZ_REFRESH_DEFAULT ENV gesetzt.');
-      }
-    } else {
-      console.log('[BOOT] token.json vorhanden.');
-    }
-  } catch (e) {
-    console.error('[BOOT] Fehler beim Laden/Refresh aus ENV:', e);
-  }
-}
-bootstrapTokenFromEnvIfNeeded();
-
-// -----------------------------------------
 // OAuth Flows
 // -----------------------------------------
-app.get('/auth/azure', async (req, res) => {
+app.get('/auth/azure', async (_req, res) => {
   try {
     if (!azureClient) return res.status(500).send('Azure nicht konfiguriert.');
     const state = 'default';
@@ -155,7 +165,7 @@ async function ensureAzureAccessToken() {
   }
 
   if (!t && process.env.AZ_REFRESH_DEFAULT) {
-    console.log('[ensureToken] Kein token.json, refreshe über ENV...');
+    console.log('[ensureToken] Kein token.json, refreshe über ENV…');
     const refreshed = await azureClient.refresh(process.env.AZ_REFRESH_DEFAULT);
     fs.writeFileSync(TOKEN_FILE, JSON.stringify(refreshed, null, 2));
     t = refreshed;
@@ -168,7 +178,7 @@ async function ensureAzureAccessToken() {
   const now = Math.floor(Date.now() / 1000);
   const exp = t.expires_at || (now + 60);
   if ((exp - now) < 300 && t.refresh_token) {
-    console.log('[ensureToken] Token läuft bald ab, refreshe...');
+    console.log('[ensureToken] Token läuft bald ab, refreshe…');
     const refreshed = await azureClient.refresh(t.refresh_token);
     fs.writeFileSync(TOKEN_FILE, JSON.stringify(refreshed, null, 2));
     return refreshed.access_token;
@@ -192,7 +202,13 @@ function parseTimeslot(dateStr, timeStr, durationMin = 30) {
 // -----------------------------------------
 app.get('/debug/status', (_req, res) => {
   try {
-    if (!fs.existsSync(TOKEN_FILE)) return res.json({ ok: true, hasTokenFile: false });
+    if (!fs.existsSync(TOKEN_FILE)) {
+      return res.json({
+        ok: true,
+        hasTokenFile: false,
+        hasAZ_REFRESH_DEFAULT: !!process.env.AZ_REFRESH_DEFAULT
+      });
+    }
     const t = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
     res.json({
       ok: true,
@@ -403,3 +419,4 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 // -----------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
