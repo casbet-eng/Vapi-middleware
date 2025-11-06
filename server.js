@@ -188,12 +188,67 @@ async function ensureAzureAccessToken() {
 }
 
 // -----------------------------------------
-// Helpers
+// Helpers (NEU: robuste Normalisierung)
 // -----------------------------------------
+function normalizeTime(input) {
+  if (!input) return null;
+  let s = String(input).trim().toLowerCase();
+
+  // AM/PM merken
+  const hasPM = /pm/.test(s);
+  const hasAM = /am/.test(s);
+
+  // Störwörter/Trennzeichen bereinigen
+  s = s
+    .replace(/uhr/g, '')
+    .replace(/\s+/g, '')
+    .replace(/[^\d:]/g, ':')   // Punkte/Kommas etc. → :
+    .replace(/:+/g, ':')       // Mehrfach-Doppelpunkt zu einem
+    .replace(/^:|:$/g, '');    // führende/abschließende : weg
+
+  // Erlaube "15", "15:00", "3", "3:30"
+  const m = s.match(/^(\d{1,2})(?::(\d{1,2}))?$/);
+  if (!m) return null;
+
+  let hh = parseInt(m[1], 10);
+  let mm = m[2] ? parseInt(m[2], 10) : 0;
+
+  if (hasPM && hh < 12) hh += 12;
+  if (hasAM && hh === 12) hh = 0;
+
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+}
+
+function normalizeDate(input) {
+  if (!input) return null;
+  const s = String(input).trim();
+  // Erlaube 2025-11-06, 2025/11/06, 2025.11.06
+  let d = s.replace(/\./g, '-').replace(/\//g, '-');
+  const m = d.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (!m) return null;
+  const yyyy = m[1], mm = m[2].padStart(2, '0'), dd = m[3].padStart(2, '0');
+  const iso = `${yyyy}-${mm}-${dd}`;
+  const test = new Date(`${iso}T00:00:00`);
+  if (Number.isNaN(test.getTime())) return null;
+  return iso;
+}
+
 function parseTimeslot(dateStr, timeStr, durationMin = 30) {
-  if (!dateStr || !timeStr) throw new Error('date/time fehlen');
-  const start = new Date(`${dateStr}T${timeStr}:00`);
-  const end = new Date(start.getTime() + durationMin * 60 * 1000);
+  const d = normalizeDate(dateStr);
+  const t = normalizeTime(timeStr);
+  if (!d || !t) {
+    const err = new Error('invalid_date_time');
+    err.code = 'INVALID_DATE_TIME';
+    throw err;
+  }
+  const start = new Date(`${d}T${t}:00`);
+  if (Number.isNaN(start.getTime())) {
+    const err = new Error('invalid_date_time');
+    err.code = 'INVALID_DATE_TIME';
+    throw err;
+  }
+  const end = new Date(start.getTime() + Number(durationMin || 30) * 60000);
   return { start, end };
 }
 
@@ -314,9 +369,23 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
     console.log('[WEBHOOK] tool-call intent:', intent, 'keys:', Object.keys(data || {}));
 
     const token = await ensureAzureAccessToken();
-    const { start, end } = parseTimeslot(data.date, data.time, duration);
-    const startISO = start.toISOString();
-    const endISO   = end.toISOString();
+let start, end, startISO, endISO;
+try {
+  ({ start, end } = parseTimeslot(data.date, data.time, duration));
+  startISO = start.toISOString();
+  endISO   = end.toISOString();
+} catch (e) {
+  if (e.code === 'INVALID_DATE_TIME') {
+    return res.status(400).json({
+      ok: false,
+      error: 'invalid_date_time',
+      hint: 'Erwarte date=YYYY-MM-DD und time=HH:mm (z.B. 15:00)',
+      got: { date: data.date, time: data.time }
+    });
+  }
+  throw e; // andere Fehler weiterwerfen
+}
+
 
     // --- check_availability ---
     if (intent === 'check_availability') {
@@ -419,4 +488,5 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 // -----------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
