@@ -32,36 +32,38 @@ const SCOPES = ['offline_access', 'openid', 'profile', 'email', 'Calendars.ReadW
 let azureClient;
 
 // -----------------------------------------
-// Helper: strict secret header (robust + hashed logging)
+// Helper: strict secret header (robust + sanitized)
 // -----------------------------------------
-function hash8(v) {
-  return require('crypto').createHash('sha256').update(String(v || '')).digest('hex').slice(0, 8);
-}
-function clean(v) { return String(v || '').trim(); }
+const crypto = require('crypto');
 
+function clean(v) { return String(v || '').trim(); }
+function hash8(v) { return crypto.createHash('sha256').update(String(v || '')).digest('hex').slice(0, 8); }
+
+/**
+ * Liest eingehendes Secret aus mehreren möglichen Quellen
+ * und entfernt führende ", " oder Spaces, die Vapi gelegentlich mitschickt.
+ */
 function extractIncomingSecret(req) {
   // 1) Bevorzugt: x-vapi-secret
-  const headerRaw = req.get('x-vapi-secret') || req.get('X-Vapi-Secret') || '';
+  const headerRaw = req.get('x-vapi-secret') || req.get('X-Vapi-Secret');
 
   // 2) Fallback: Authorization: Bearer <token>
-  const auth = req.get('authorization') || req.get('Authorization') || '';
-  let bearer = '';
+  const auth = req.get('authorization') || req.get('Authorization');
+  let bearer = null;
   if (auth && /^bearer\s+/i.test(auth)) {
     bearer = auth.replace(/^bearer\s+/i, '').trim();
   }
 
-  // 3) Weitere Fallbacks: x-api-key / query / body
-  const xApiKey = req.get('x-api-key') || req.get('X-Api-Key') || '';
-  const q = (req.query && req.query.secret) ? String(req.query.secret) : '';
-  const b = (req.body  && req.body.secret)  ? String(req.body.secret)  : '';
+  // 3) Weitere Fallbacks
+  const xApiKey = req.get('x-api-key') || req.get('X-Api-Key');
+  const q = req.query?.secret;
+  const b = req.body?.secret;
 
   // Reihenfolge: header > bearer > x-api-key > query > body
   let candidate = clean(headerRaw || bearer || xApiKey || q || b || '');
 
-  // Harte Sanitizer: führende Interpunktionszeichen/Spaces/NBSP entfernen
-  candidate = candidate
-    .replace(/^[\s,;]+/, '')   // führende Kommas/Spaces/Semikola
-    .replace(/\u00A0/g, '');   // non-breaking space entfernen
+  // **Fix:** Vapi schickt teils ein führendes ", " mit – hier hart entfernen.
+  candidate = candidate.replace(/^[,\s]+/, '');
 
   return {
     candidate,
@@ -71,31 +73,21 @@ function extractIncomingSecret(req) {
 }
 
 function requireVapiSecret(req, res, next) {
-  const expected = clean(process.env.VAPI_SECRET || '');
-  if (!expected) return next(); // Secret-Schutz aus, falls nicht gesetzt
+  const envSecret = clean(process.env.VAPI_SECRET || '');
+  if (!envSecret) return next(); // Schutz aus, wenn nicht gesetzt
 
   const { candidate, sources, raw } = extractIncomingSecret(req);
+  const ok = !!candidate && candidate === envSecret;
 
-  // lauter Debug – zeigt Klartext & hex (um unsichtbare Zeichen zu sehen)
-  console.log('[AUTH] expected(raw)=', expected,
-              '| hdr(raw)=', raw.headerRaw || '',
-              '| bearer(raw)=', raw.bearer || '',
-              '| xApi(raw)=', raw.xApiKey || '',
-              '| query(raw)=', raw.q || '',
-              '| body(raw)=', raw.b || '');
-  console.log('[AUTH] expected(hex)=', hexDump(expected),
-              '| hdr(hex)=', hexDump(raw.headerRaw || ''));
+  // Nur kurze, sichere Logs (keine nicht definierten Helper, keine Klartext-Secrets)
+  console.log(
+    `[AUTH] eq=${ok} hdr=${hash8(raw.headerRaw)} env=${hash8(envSecret)} src=${JSON.stringify(sources)}`
+  );
 
-  const ok = expected && candidate && (candidate === expected);
-  console.log('[AUTH] eq=', ok,
-              'hdr=', hash8(candidate),
-              'env=', hash8(expected),
-              'src=', JSON.stringify(sources));
+  if (ok) return next();
 
-  if (!ok) {
-    return res.status(401).json({ ok:false, error:'unauthorized' });
-  }
-  next();
+  console.warn('[AUTH] x-vapi-secret missing/mismatch. Present?:', !!candidate);
+  return res.status(401).json({ ok: false, error: 'unauthorized' });
 }
 
 // Beim Booten: Hash vom ENV-Secret loggen (kein Klartext!)
@@ -573,5 +565,6 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 // -----------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
