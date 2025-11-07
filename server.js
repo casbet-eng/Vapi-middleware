@@ -26,15 +26,19 @@ const SCOPES = ['offline_access', 'openid', 'profile', 'email', 'Calendars.ReadW
 
 let azureClient;
 
-// -----------------------------------------
 // Helper: strict secret header (optional)
-// -----------------------------------------
+// TEMP: mit Logging, um Header-Probleme sichtbar zu machen
 function requireVapiSecret(req, res, next) {
-  if (!process.env.VAPI_SECRET) return next();
-  const val = req.get('x-vapi-secret');
-  if (val && val === process.env.VAPI_SECRET) return next();
+  const expected = process.env.VAPI_SECRET;
+  if (!expected) return next(); // kein Secret gesetzt -> nicht prüfen
+
+  const got = req.get('x-vapi-secret') || '';
+  if (got === expected) return next();
+
+  console.warn('[AUTH] x-vapi-secret missing/mismatch. Present?:', !!got);
   return res.status(401).json({ ok: false, error: 'unauthorized' });
 }
+
 
 // -----------------------------------------
 // Bootstrap: Falls kein token.json -> über ENV refreshen
@@ -327,6 +331,13 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
       req.body?.name ||
       null;
 
+        // --- Nur unsere Tool-Intents verarbeiten, alle anderen Events ignorieren
+    const allowed = new Set(['check_availability','create_appointment']);
+    if (!allowed.has(intent)) {
+      // NICHT erroren – nur still bestätigen, damit Vapi-Events keinen Spam verursachen
+      return res.json({ ok: true, ignored: true });
+    }
+
     // 2) Daten normalisieren
     let data = req.body?.data && typeof req.body.data === 'object' ? req.body.data : {};
 
@@ -488,5 +499,6 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 // -----------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
