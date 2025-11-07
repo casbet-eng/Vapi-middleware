@@ -30,9 +30,6 @@ let azureClient;
 // -----------------------------------------
 // Helper: strict secret header (robust + hashed logging)
 // -----------------------------------------
-// -----------------------------------------
-// Helper: strict secret header (robust + hashed logging)
-// -----------------------------------------
 function hash8(v) {
   return crypto.createHash('sha256').update(String(v || '')).digest('hex').slice(0, 8);
 }
@@ -59,6 +56,10 @@ function extractIncomingSecret(req) {
   return { candidate, sources: { header: !!headerRaw, bearer: !!bearer, xApiKey: !!xApiKey, query: !!q, body: !!b } };
 }
 
+function hexDump(str) {
+  return Array.from(String(str)).map(c => c.charCodeAt(0).toString(16).padStart(2,'0')).join(' ');
+}
+
 // === DEBUG HELPERS ===
 function hexDump(str) {
   return Array.from(String(str)).map(c => c.charCodeAt(0).toString(16).padStart(2,'0')).join(' ');
@@ -67,31 +68,36 @@ function hexDump(str) {
 function requireVapiSecret(req, res, next) {
   const expected = (process.env.VAPI_SECRET || '').trim();
 
-  // alle möglichen Stellen prüfen
-  const hdr    = (req.get('x-vapi-secret') || '').trim();
-  const bearer = ((req.get('authorization') || '').replace(/^Bearer\s+/i, '')).trim();
-  const xApi   = (req.get('x-api-key') || '').trim();
-  const q      = (req.query?.vapi_secret || '').trim();
-  const body   = (req.body?.vapi_secret || '').trim();
+  if (!expected) {
+    // Secret-Schutz ist aus – durchlassen
+    return next();
+  }
 
-  const candidate = hdr || bearer || xApi || q || body;
+  const headerRaw = req.get('x-vapi-secret') || req.get('X-Vapi-Secret') || '';
+  const auth      = req.get('authorization') || req.get('Authorization') || '';
+  const bearer    = /^bearer\s+/i.test(auth) ? auth.replace(/^bearer\s+/i, '').trim() : '';
+  const xApiKey   = req.get('x-api-key') || req.get('X-Api-Key') || '';
+  const q         = (req.query?.vapi_secret || req.query?.secret || '').trim();
+  const b         = (req.body?.vapi_secret || req.body?.secret || '').trim();
 
-  // >>> NEUER, extra lauter Debug-Log
+  const candidate = (headerRaw || bearer || xApiKey || q || b || '').trim();
+
+  // Lauter Debug: Rohwerte + HEX ausgeben (zeigt unsichtbare Zeichen)
   console.log('[AUTH] expected(raw)=', expected,
-              '| hdr(raw)=', hdr,
+              '| hdr(raw)=', headerRaw,
               '| bearer(raw)=', bearer,
-              '| xApi(raw)=', xApi,
+              '| xApi(raw)=', xApiKey,
               '| query(raw)=', q,
-              '| body(raw)=', body);
+              '| body(raw)=', b);
 
   console.log('[AUTH] expected(hex)=', hexDump(expected),
-              '| hdr(hex)=', hexDump(hdr));
+              '| hdr(hex)=', hexDump(headerRaw));
 
   const ok = expected && candidate && (candidate === expected);
 
   console.log('[AUTH] eq=', ok,
               'src=', JSON.stringify({
-                header: !!hdr, bearer: !!bearer, xApiKey: !!xApi, query: !!q, body: !!body
+                header: !!headerRaw, bearer: !!bearer, xApiKey: !!xApiKey, query: !!q, body: !!b
               }));
 
   if (!ok) {
@@ -102,6 +108,32 @@ function requireVapiSecret(req, res, next) {
 
 // Beim Booten: Hash vom ENV-Secret loggen (kein Klartext!)
 console.log('[BOOT] VAPI_SECRET hash =', process.env.VAPI_SECRET ? hash8(process.env.VAPI_SECRET) : '(none)');
+
+// -----------------------------------------
+// Init Azure OpenID Client (ruft Bootstrap NACH Init)
+// -----------------------------------------
+(async function initAzure() {
+  try {
+    if (!process.env.AZ_TENANT_ID || !process.env.AZ_CLIENT_ID || !process.env.AZ_CLIENT_SECRET || !process.env.AZ_REDIRECT_URI) {
+      console.warn('Azure ENV Variablen fehlen. Setze AZ_TENANT_ID, AZ_CLIENT_ID, AZ_CLIENT_SECRET, AZ_REDIRECT_URI');
+      return;
+    }
+
+    const issuer = await Issuer.discover(`https://login.microsoftonline.com/${process.env.AZ_TENANT_ID}/v2.0`);
+    azureClient = new issuer.Client({
+      client_id: process.env.AZ_CLIENT_ID,
+      client_secret: process.env.AZ_CLIENT_SECRET,
+      redirect_uris: [process.env.AZ_REDIRECT_URI],
+      response_types: ['code'],
+    });
+    console.log('Azure OIDC client initialisiert.');
+
+    // 👉 WICHTIG: Bootstrap ERST JETZT, wenn azureClient existiert
+    await bootstrapTokenFromEnvIfNeeded();
+  } catch (e) {
+    console.error('Azure init error', e);
+  }
+})();
 
 // -----------------------------------------
 // Bootstrap: Falls kein token.json -> über ENV refreshen
@@ -133,32 +165,6 @@ async function bootstrapTokenFromEnvIfNeeded() {
     console.error('[BOOT] Fehler beim Laden/Refresh aus ENV:', e);
   }
 }
-
-// -----------------------------------------
-// Init Azure OpenID Client (ruft Bootstrap NACH Init)
-// -----------------------------------------
-(async function initAzure() {
-  try {
-    if (!process.env.AZ_TENANT_ID || !process.env.AZ_CLIENT_ID || !process.env.AZ_CLIENT_SECRET || !process.env.AZ_REDIRECT_URI) {
-      console.warn('Azure ENV Variablen fehlen. Setze AZ_TENANT_ID, AZ_CLIENT_ID, AZ_CLIENT_SECRET, AZ_REDIRECT_URI');
-      return;
-    }
-
-    const issuer = await Issuer.discover(`https://login.microsoftonline.com/${process.env.AZ_TENANT_ID}/v2.0`);
-    azureClient = new issuer.Client({
-      client_id: process.env.AZ_CLIENT_ID,
-      client_secret: process.env.AZ_CLIENT_SECRET,
-      redirect_uris: [process.env.AZ_REDIRECT_URI],
-      response_types: ['code'],
-    });
-    console.log('Azure OIDC client initialisiert.');
-
-    // 👉 WICHTIG: Bootstrap ERST JETZT, wenn azureClient existiert
-    await bootstrapTokenFromEnvIfNeeded();
-  } catch (e) {
-    console.error('Azure init error', e);
-  }
-})();
 
 // -----------------------------------------
 // OAuth Flows
@@ -577,6 +583,7 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 // -----------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
 
