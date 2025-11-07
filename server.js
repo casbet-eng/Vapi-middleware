@@ -14,6 +14,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const fetch = require('node-fetch'); // v2.x
 const { Issuer } = require('openid-client');
+const crypto = require('crypto');
 
 const app = express();
 app.use(bodyParser.json());
@@ -26,19 +27,36 @@ const SCOPES = ['offline_access', 'openid', 'profile', 'email', 'Calendars.ReadW
 
 let azureClient;
 
-// Helper: strict secret header (optional)
-// TEMP: mit Logging, um Header-Probleme sichtbar zu machen
-function requireVapiSecret(req, res, next) {
-  const expected = process.env.VAPI_SECRET;
-  if (!expected) return next(); // kein Secret gesetzt -> nicht prüfen
-
-  const got = req.get('x-vapi-secret') || '';
-  if (got === expected) return next();
-
-  console.warn('[AUTH] x-vapi-secret missing/mismatch. Present?:', !!got);
-  return res.status(401).json({ ok: false, error: 'unauthorized' });
+// -----------------------------------------
+// Helper: strict secret header (robust + hashed logging)
+// -----------------------------------------
+function hash8(v) {
+  return crypto.createHash('sha256').update(String(v || '')).digest('hex').slice(0, 8);
 }
 
+function clean(v) {
+  return String(v || '').trim();
+}
+
+function requireVapiSecret(req, res, next) {
+  // Wenn kein Secret gesetzt ist, nicht blocken
+  if (!process.env.VAPI_SECRET) return next();
+
+  // Beide Header-Varianten akzeptieren (Groß-/Kleinschreibung)
+  const headerRaw = req.get('x-vapi-secret') || req.get('X-Vapi-Secret');
+  const header = clean(headerRaw);
+  const env = clean(process.env.VAPI_SECRET);
+
+  const ok = header && env && header === env;
+
+  // Fingerprints (8-stelliger Hash), niemals Secret im Klartext loggen
+  console.log(`[AUTH] check: hdr=${hash8(header)} env=${hash8(env)} eq=${ok}`);
+
+  if (ok) return next();
+
+  console.warn('[AUTH] x-vapi-secret missing/mismatch. Present?:', !!headerRaw);
+  return res.status(401).json({ ok: false, error: 'unauthorized' });
+}
 
 // -----------------------------------------
 // Bootstrap: Falls kein token.json -> über ENV refreshen
@@ -499,6 +517,7 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 // -----------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
 
