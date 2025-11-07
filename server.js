@@ -32,38 +32,37 @@ const SCOPES = ['offline_access', 'openid', 'profile', 'email', 'Calendars.ReadW
 let azureClient;
 
 // -----------------------------------------
-// Helper: strict secret header (robust + loud debug)
+// Helper: strict secret header (robust + hashed logging)
 // -----------------------------------------
 function hash8(v) {
-  return crypto.createHash('sha256').update(String(v || '')).digest('hex').slice(0, 8);
+  return require('crypto').createHash('sha256').update(String(v || '')).digest('hex').slice(0, 8);
 }
 function clean(v) { return String(v || '').trim(); }
-function hexDump(str) {
-  return Array.from(String(str || '')).map(c => c.charCodeAt(0).toString(16).padStart(2,'0')).join(' ');
-}
 
 function extractIncomingSecret(req) {
   // 1) Bevorzugt: x-vapi-secret
-  const headerRaw = req.get('x-vapi-secret') || req.get('X-Vapi-Secret');
+  const headerRaw = req.get('x-vapi-secret') || req.get('X-Vapi-Secret') || '';
 
   // 2) Fallback: Authorization: Bearer <token>
-  const auth = req.get('authorization') || req.get('Authorization');
-  let bearer = null;
+  const auth = req.get('authorization') || req.get('Authorization') || '';
+  let bearer = '';
   if (auth && /^bearer\s+/i.test(auth)) {
     bearer = auth.replace(/^bearer\s+/i, '').trim();
   }
 
-  // 3) weitere Fallbacks: x-api-key / query / body
-  const xApiKey = req.get('x-api-key') || req.get('X-Api-Key');
-
-  const q = clean(req.query?.vapi_secret || req.query?.secret || '');
-  const b = clean(req.body?.vapi_secret || req.body?.secret || '');
+  // 3) Weitere Fallbacks: x-api-key / query / body
+  const xApiKey = req.get('x-api-key') || req.get('X-Api-Key') || '';
+  const q = (req.query && req.query.secret) ? String(req.query.secret) : '';
+  const b = (req.body  && req.body.secret)  ? String(req.body.secret)  : '';
 
   // Reihenfolge: header > bearer > x-api-key > query > body
-  const candidate = clean(headerRaw || bearer || xApiKey || q || b || '');
   let candidate = clean(headerRaw || bearer || xApiKey || q || b || '');
-// harte Sanitizer gegen führende Interpunktions-Zeichen
-candidate = candidate.replace(/^[,\s]+/, ''); // entfernt führende Kommas/Spaces
+
+  // Harte Sanitizer: führende Interpunktionszeichen/Spaces/NBSP entfernen
+  candidate = candidate
+    .replace(/^[\s,;]+/, '')   // führende Kommas/Spaces/Semikola
+    .replace(/\u00A0/g, '');   // non-breaking space entfernen
+
   return {
     candidate,
     sources: { header: !!headerRaw, bearer: !!bearer, xApiKey: !!xApiKey, query: !!q, body: !!b },
@@ -574,4 +573,5 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 // -----------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
