@@ -34,8 +34,6 @@ let azureClient;
 // -----------------------------------------
 // Helper: strict secret header (robust + sanitized)
 // -----------------------------------------
-const crypto = require('crypto');
-
 function clean(v) { return String(v || '').trim(); }
 function hash8(v) { return crypto.createHash('sha256').update(String(v || '')).digest('hex').slice(0, 8); }
 
@@ -565,6 +563,7 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 // -----------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
 
