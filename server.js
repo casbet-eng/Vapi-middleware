@@ -61,6 +61,9 @@ function extractIncomingSecret(req) {
 
   // Reihenfolge: header > bearer > x-api-key > query > body
   const candidate = clean(headerRaw || bearer || xApiKey || q || b || '');
+  let candidate = clean(headerRaw || bearer || xApiKey || q || b || '');
+// harte Sanitizer gegen führende Interpunktions-Zeichen
+candidate = candidate.replace(/^[,\s]+/, ''); // entfernt führende Kommas/Spaces
   return {
     candidate,
     sources: { header: !!headerRaw, bearer: !!bearer, xApiKey: !!xApiKey, query: !!q, body: !!b },
@@ -571,3 +574,4 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 // -----------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
