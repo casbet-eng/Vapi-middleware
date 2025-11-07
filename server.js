@@ -30,33 +30,51 @@ let azureClient;
 // -----------------------------------------
 // Helper: strict secret header (robust + hashed logging)
 // -----------------------------------------
+// -----------------------------------------
+// Helper: strict secret header (robust + hashed logging)
+// -----------------------------------------
 function hash8(v) {
   return crypto.createHash('sha256').update(String(v || '')).digest('hex').slice(0, 8);
 }
+function clean(v) { return String(v || '').trim(); }
 
-function clean(v) {
-  return String(v || '').trim();
+function extractIncomingSecret(req) {
+  // 1) Bevorzugt: x-vapi-secret
+  const headerRaw = req.get('x-vapi-secret') || req.get('X-Vapi-Secret');
+
+  // 2) Fallback: Authorization: Bearer <token>
+  const auth = req.get('authorization') || req.get('Authorization');
+  let bearer = null;
+  if (auth && /^bearer\s+/i.test(auth)) {
+    bearer = auth.replace(/^bearer\s+/i, '').trim();
+  }
+
+  // 3) weitere Fallbacks: x-api-key / query / body
+  const xApiKey = req.get('x-api-key') || req.get('X-Api-Key');
+  const q = req.query?.secret;
+  const b = req.body?.secret;
+
+  // Reihenfolge: header > bearer > x-api-key > query > body
+  const candidate = clean(headerRaw || bearer || xApiKey || q || b || '');
+  return { candidate, sources: { header: !!headerRaw, bearer: !!bearer, xApiKey: !!xApiKey, query: !!q, body: !!b } };
 }
 
 function requireVapiSecret(req, res, next) {
-  // Wenn kein Secret gesetzt ist, nicht blocken
-  if (!process.env.VAPI_SECRET) return next();
+  const envSecret = clean(process.env.VAPI_SECRET || '');
+  if (!envSecret) return next(); // Secret-Schutz aus, falls nicht gesetzt
 
-  // Beide Header-Varianten akzeptieren (Groß-/Kleinschreibung)
-  const headerRaw = req.get('x-vapi-secret') || req.get('X-Vapi-Secret');
-  const header = clean(headerRaw);
-  const env = clean(process.env.VAPI_SECRET);
+  const { candidate, sources } = extractIncomingSecret(req);
+  const ok = candidate && envSecret && candidate === envSecret;
 
-  const ok = header && env && header === env;
-
-  // Fingerprints (8-stelliger Hash), niemals Secret im Klartext loggen
-  console.log(`[AUTH] check: hdr=${hash8(header)} env=${hash8(env)} eq=${ok}`);
-
+  console.log(`[AUTH] hdr=${hash8(candidate)} env=${hash8(envSecret)} eq=${ok} src=${JSON.stringify(sources)}`);
   if (ok) return next();
 
-  console.warn('[AUTH] x-vapi-secret missing/mismatch. Present?:', !!headerRaw);
+  console.warn('[AUTH] x-vapi-secret missing/mismatch. Present?:', !!candidate);
   return res.status(401).json({ ok: false, error: 'unauthorized' });
 }
+
+// Beim Booten: Hash vom ENV-Secret loggen (kein Klartext!)
+console.log('[BOOT] VAPI_SECRET hash =', process.env.VAPI_SECRET ? hash8(process.env.VAPI_SECRET) : '(none)');
 
 // -----------------------------------------
 // Bootstrap: Falls kein token.json -> über ENV refreshen
@@ -299,6 +317,21 @@ app.get('/debug/status', (_req, res) => {
   }
 });
 
+app.get('/debug/secret', (req, res) => {
+  const envSecret = process.env.VAPI_SECRET || '';
+  const header = req.get('x-vapi-secret') || req.get('X-Vapi-Secret') || '';
+  const auth = req.get('authorization') || req.get('Authorization') || '';
+  let bearer = null;
+  if (auth && /^bearer\s+/i.test(auth)) bearer = auth.replace(/^bearer\s+/i, '').trim();
+
+  res.json({
+    ok: true,
+    envHash: envSecret ? crypto.createHash('sha256').update(envSecret).digest('hex').slice(0,8) : null,
+    headerHash: header ? crypto.createHash('sha256').update(header).digest('hex').slice(0,8) : null,
+    bearerHash: bearer ? crypto.createHash('sha256').update(bearer).digest('hex').slice(0,8) : null
+  });
+});
+
 app.get('/debug/me', async (_req, res) => {
   try {
     const token = await ensureAzureAccessToken();
@@ -517,6 +550,7 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 // -----------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
 
