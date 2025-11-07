@@ -59,18 +59,45 @@ function extractIncomingSecret(req) {
   return { candidate, sources: { header: !!headerRaw, bearer: !!bearer, xApiKey: !!xApiKey, query: !!q, body: !!b } };
 }
 
+// === DEBUG HELPERS ===
+function hexDump(str) {
+  return Array.from(String(str)).map(c => c.charCodeAt(0).toString(16).padStart(2,'0')).join(' ');
+}
+
 function requireVapiSecret(req, res, next) {
-  const envSecret = clean(process.env.VAPI_SECRET || '');
-  if (!envSecret) return next(); // Secret-Schutz aus, falls nicht gesetzt
+  const expected = (process.env.VAPI_SECRET || '').trim();
 
-  const { candidate, sources } = extractIncomingSecret(req);
-  const ok = candidate && envSecret && candidate === envSecret;
+  // alle möglichen Stellen prüfen
+  const hdr    = (req.get('x-vapi-secret') || '').trim();
+  const bearer = ((req.get('authorization') || '').replace(/^Bearer\s+/i, '')).trim();
+  const xApi   = (req.get('x-api-key') || '').trim();
+  const q      = (req.query?.vapi_secret || '').trim();
+  const body   = (req.body?.vapi_secret || '').trim();
 
-  console.log(`[AUTH] hdr=${hash8(candidate)} env=${hash8(envSecret)} eq=${ok} src=${JSON.stringify(sources)}`);
-  if (ok) return next();
+  const candidate = hdr || bearer || xApi || q || body;
 
-  console.warn('[AUTH] x-vapi-secret missing/mismatch. Present?:', !!candidate);
-  return res.status(401).json({ ok: false, error: 'unauthorized' });
+  // >>> NEUER, extra lauter Debug-Log
+  console.log('[AUTH] expected(raw)=', expected,
+              '| hdr(raw)=', hdr,
+              '| bearer(raw)=', bearer,
+              '| xApi(raw)=', xApi,
+              '| query(raw)=', q,
+              '| body(raw)=', body);
+
+  console.log('[AUTH] expected(hex)=', hexDump(expected),
+              '| hdr(hex)=', hexDump(hdr));
+
+  const ok = expected && candidate && (candidate === expected);
+
+  console.log('[AUTH] eq=', ok,
+              'src=', JSON.stringify({
+                header: !!hdr, bearer: !!bearer, xApiKey: !!xApi, query: !!q, body: !!body
+              }));
+
+  if (!ok) {
+    return res.status(401).json({ ok:false, error:'unauthorized' });
+  }
+  next();
 }
 
 // Beim Booten: Hash vom ENV-Secret loggen (kein Klartext!)
@@ -550,6 +577,7 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 // -----------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
 
