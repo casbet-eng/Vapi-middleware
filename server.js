@@ -17,23 +17,30 @@ const { Issuer } = require('openid-client');
 const crypto = require('crypto');
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(bodyParser.json());
 
 // -----------------------------------------
 // Settings & files
 // -----------------------------------------
-const TOKEN_FILE = path.join(__dirname, 'token.json'); // Persistenter Tokenstore
+const TOKEN_FILE = process.env.TOKENS_PATH
+  ? process.env.TOKENS_PATH
+  : path.join(__dirname, 'token.json'); // Persistenter Tokenstore
+
 const SCOPES = ['offline_access', 'openid', 'profile', 'email', 'Calendars.ReadWrite'];
 
 let azureClient;
 
 // -----------------------------------------
-// Helper: strict secret header (robust + hashed logging)
+// Helper: strict secret header (robust + loud debug)
 // -----------------------------------------
 function hash8(v) {
   return crypto.createHash('sha256').update(String(v || '')).digest('hex').slice(0, 8);
 }
 function clean(v) { return String(v || '').trim(); }
+function hexDump(str) {
+  return Array.from(String(str || '')).map(c => c.charCodeAt(0).toString(16).padStart(2,'0')).join(' ');
+}
 
 function extractIncomingSecret(req) {
   // 1) Bevorzugt: x-vapi-secret
@@ -48,57 +55,40 @@ function extractIncomingSecret(req) {
 
   // 3) weitere Fallbacks: x-api-key / query / body
   const xApiKey = req.get('x-api-key') || req.get('X-Api-Key');
-  const q = req.query?.secret;
-  const b = req.body?.secret;
+
+  const q = clean(req.query?.vapi_secret || req.query?.secret || '');
+  const b = clean(req.body?.vapi_secret || req.body?.secret || '');
 
   // Reihenfolge: header > bearer > x-api-key > query > body
   const candidate = clean(headerRaw || bearer || xApiKey || q || b || '');
-  return { candidate, sources: { header: !!headerRaw, bearer: !!bearer, xApiKey: !!xApiKey, query: !!q, body: !!b } };
-}
-
-function hexDump(str) {
-  return Array.from(String(str)).map(c => c.charCodeAt(0).toString(16).padStart(2,'0')).join(' ');
-}
-
-// === DEBUG HELPERS ===
-function hexDump(str) {
-  return Array.from(String(str)).map(c => c.charCodeAt(0).toString(16).padStart(2,'0')).join(' ');
+  return {
+    candidate,
+    sources: { header: !!headerRaw, bearer: !!bearer, xApiKey: !!xApiKey, query: !!q, body: !!b },
+    raw: { headerRaw, bearer, xApiKey, q, b }
+  };
 }
 
 function requireVapiSecret(req, res, next) {
-  const expected = (process.env.VAPI_SECRET || '').trim();
+  const expected = clean(process.env.VAPI_SECRET || '');
+  if (!expected) return next(); // Secret-Schutz aus, falls nicht gesetzt
 
-  if (!expected) {
-    // Secret-Schutz ist aus – durchlassen
-    return next();
-  }
+  const { candidate, sources, raw } = extractIncomingSecret(req);
 
-  const headerRaw = req.get('x-vapi-secret') || req.get('X-Vapi-Secret') || '';
-  const auth      = req.get('authorization') || req.get('Authorization') || '';
-  const bearer    = /^bearer\s+/i.test(auth) ? auth.replace(/^bearer\s+/i, '').trim() : '';
-  const xApiKey   = req.get('x-api-key') || req.get('X-Api-Key') || '';
-  const q         = (req.query?.vapi_secret || req.query?.secret || '').trim();
-  const b         = (req.body?.vapi_secret || req.body?.secret || '').trim();
-
-  const candidate = (headerRaw || bearer || xApiKey || q || b || '').trim();
-
-  // Lauter Debug: Rohwerte + HEX ausgeben (zeigt unsichtbare Zeichen)
+  // lauter Debug – zeigt Klartext & hex (um unsichtbare Zeichen zu sehen)
   console.log('[AUTH] expected(raw)=', expected,
-              '| hdr(raw)=', headerRaw,
-              '| bearer(raw)=', bearer,
-              '| xApi(raw)=', xApiKey,
-              '| query(raw)=', q,
-              '| body(raw)=', b);
-
+              '| hdr(raw)=', raw.headerRaw || '',
+              '| bearer(raw)=', raw.bearer || '',
+              '| xApi(raw)=', raw.xApiKey || '',
+              '| query(raw)=', raw.q || '',
+              '| body(raw)=', raw.b || '');
   console.log('[AUTH] expected(hex)=', hexDump(expected),
-              '| hdr(hex)=', hexDump(headerRaw));
+              '| hdr(hex)=', hexDump(raw.headerRaw || ''));
 
   const ok = expected && candidate && (candidate === expected);
-
   console.log('[AUTH] eq=', ok,
-              'src=', JSON.stringify({
-                header: !!headerRaw, bearer: !!bearer, xApiKey: !!xApiKey, query: !!q, body: !!b
-              }));
+              'hdr=', hash8(candidate),
+              'env=', hash8(expected),
+              'src=', JSON.stringify(sources));
 
   if (!ok) {
     return res.status(401).json({ ok:false, error:'unauthorized' });
@@ -110,34 +100,19 @@ function requireVapiSecret(req, res, next) {
 console.log('[BOOT] VAPI_SECRET hash =', process.env.VAPI_SECRET ? hash8(process.env.VAPI_SECRET) : '(none)');
 
 // -----------------------------------------
-// Init Azure OpenID Client (ruft Bootstrap NACH Init)
+// Mini CORS/Preflight nur für Test-Tools
 // -----------------------------------------
-(async function initAzure() {
-  try {
-    if (!process.env.AZ_TENANT_ID || !process.env.AZ_CLIENT_ID || !process.env.AZ_CLIENT_SECRET || !process.env.AZ_REDIRECT_URI) {
-      console.warn('Azure ENV Variablen fehlen. Setze AZ_TENANT_ID, AZ_CLIENT_ID, AZ_CLIENT_SECRET, AZ_REDIRECT_URI');
-      return;
-    }
-
-    const issuer = await Issuer.discover(`https://login.microsoftonline.com/${process.env.AZ_TENANT_ID}/v2.0`);
-    azureClient = new issuer.Client({
-      client_id: process.env.AZ_CLIENT_ID,
-      client_secret: process.env.AZ_CLIENT_SECRET,
-      redirect_uris: [process.env.AZ_REDIRECT_URI],
-      response_types: ['code'],
-    });
-    console.log('Azure OIDC client initialisiert.');
-
-    // 👉 WICHTIG: Bootstrap ERST JETZT, wenn azureClient existiert
-    await bootstrapTokenFromEnvIfNeeded();
-  } catch (e) {
-    console.error('Azure init error', e);
-  }
-})();
+app.options('/vapi-webhook', (req, res) => {
+  res.set({
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, x-vapi-intent, x-vapi-secret, Authorization, x-api-key',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS'
+  });
+  return res.status(204).end();
+});
 
 // -----------------------------------------
-// Bootstrap: Falls kein token.json -> über ENV refreshen
-// (WICHTIG: erst aufrufen, wenn azureClient gesetzt ist!)
+// Bootstrap: Falls kein token.json -> über ENV refreshen (nach Azure-Init)
 // -----------------------------------------
 async function bootstrapTokenFromEnvIfNeeded() {
   try {
@@ -165,6 +140,31 @@ async function bootstrapTokenFromEnvIfNeeded() {
     console.error('[BOOT] Fehler beim Laden/Refresh aus ENV:', e);
   }
 }
+
+// -----------------------------------------
+// Init Azure OpenID Client (ruft Bootstrap NACH Init)
+// -----------------------------------------
+(async function initAzure() {
+  try {
+    if (!process.env.AZ_TENANT_ID || !process.env.AZ_CLIENT_ID || !process.env.AZ_CLIENT_SECRET || !process.env.AZ_REDIRECT_URI) {
+      console.warn('Azure ENV Variablen fehlen. Setze AZ_TENANT_ID, AZ_CLIENT_ID, AZ_CLIENT_SECRET, AZ_REDIRECT_URI');
+      return;
+    }
+
+    const issuer = await Issuer.discover(`https://login.microsoftonline.com/${process.env.AZ_TENANT_ID}/v2.0`);
+    azureClient = new issuer.Client({
+      client_id: process.env.AZ_CLIENT_ID,
+      client_secret: process.env.AZ_CLIENT_SECRET,
+      redirect_uris: [process.env.AZ_REDIRECT_URI],
+      response_types: ['code'],
+    });
+    console.log('Azure OIDC client initialisiert.');
+
+    await bootstrapTokenFromEnvIfNeeded();
+  } catch (e) {
+    console.error('Azure init error', e);
+  }
+})();
 
 // -----------------------------------------
 // OAuth Flows
@@ -205,7 +205,6 @@ app.get('/auth/azure/callback', async (req, res) => {
       scope: tokenSet.scope
     });
 
-    // Persistieren
     try {
       fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokenSet, null, 2));
       console.log('[OAUTH] tokenSet gespeichert -> token.json');
@@ -261,25 +260,22 @@ async function ensureAzureAccessToken() {
 }
 
 // -----------------------------------------
-// Helpers (NEU: robuste Normalisierung)
+// Helpers (Normalisierung von Datum/Zeit)
 // -----------------------------------------
 function normalizeTime(input) {
   if (!input) return null;
   let s = String(input).trim().toLowerCase();
 
-  // AM/PM merken
   const hasPM = /pm/.test(s);
   const hasAM = /am/.test(s);
 
-  // Störwörter/Trennzeichen bereinigen
   s = s
     .replace(/uhr/g, '')
     .replace(/\s+/g, '')
-    .replace(/[^\d:]/g, ':')   // Punkte/Kommas etc. → :
-    .replace(/:+/g, ':')       // Mehrfach-Doppelpunkt zu einem
-    .replace(/^:|:$/g, '');    // führende/abschließende : weg
+    .replace(/[^\d:]/g, ':')
+    .replace(/:+/g, ':')
+    .replace(/^:|:$/g, '');
 
-  // Erlaube "15", "15:00", "3", "3:30"
   const m = s.match(/^(\d{1,2})(?::(\d{1,2}))?$/);
   if (!m) return null;
 
@@ -296,7 +292,6 @@ function normalizeTime(input) {
 function normalizeDate(input) {
   if (!input) return null;
   const s = String(input).trim();
-  // Erlaube 2025-11-06, 2025/11/06, 2025.11.06
   let d = s.replace(/\./g, '-').replace(/\//g, '-');
   const m = d.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
   if (!m) return null;
@@ -415,10 +410,9 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
       req.body?.name ||
       null;
 
-        // --- Nur unsere Tool-Intents verarbeiten, alle anderen Events ignorieren
+    // Nur unsere Tool-Intents verarbeiten, alles andere ignorieren
     const allowed = new Set(['check_availability','create_appointment']);
     if (!allowed.has(intent)) {
-      // NICHT erroren – nur still bestätigen, damit Vapi-Events keinen Spam verursachen
       return res.json({ ok: true, ignored: true });
     }
 
@@ -438,18 +432,12 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
       if (maybeFlat.date || maybeFlat.time || maybeFlat.timezone) data = maybeFlat;
     }
 
-    // c) Falls weiterhin kein Intent & keine Daten: Event-Spam ignorieren
-    if (!intent && !Object.keys(data).length) {
-      console.log('[WEBHOOK] ignore non-tool event, keys:', Object.keys(req.body || {}));
-      return res.json({ ok: true, ignored: true });
-    }
-
     if (!intent) intent = 'check_availability';
 
     const timezone = data.timezone || 'Europe/Zurich';
     const duration = Number(data.durationMinutes || 30);
 
-    // Pflichtfelder bei unseren Intents
+    // Pflichtfelder
     if ((intent === 'check_availability' || intent === 'create_appointment') &&
         (!data.date || !data.time || !timezone)) {
       console.log('[WEBHOOK] missing_fields', { intent, need: ['date','time','timezone'], got: Object.keys(data || {}) });
@@ -464,23 +452,23 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
     console.log('[WEBHOOK] tool-call intent:', intent, 'keys:', Object.keys(data || {}));
 
     const token = await ensureAzureAccessToken();
-let start, end, startISO, endISO;
-try {
-  ({ start, end } = parseTimeslot(data.date, data.time, duration));
-  startISO = start.toISOString();
-  endISO   = end.toISOString();
-} catch (e) {
-  if (e.code === 'INVALID_DATE_TIME') {
-    return res.status(400).json({
-      ok: false,
-      error: 'invalid_date_time',
-      hint: 'Erwarte date=YYYY-MM-DD und time=HH:mm (z.B. 15:00)',
-      got: { date: data.date, time: data.time }
-    });
-  }
-  throw e; // andere Fehler weiterwerfen
-}
 
+    let start, end, startISO, endISO;
+    try {
+      ({ start, end } = parseTimeslot(data.date, data.time, duration));
+      startISO = start.toISOString();
+      endISO   = end.toISOString();
+    } catch (e) {
+      if (e.code === 'INVALID_DATE_TIME') {
+        return res.status(400).json({
+          ok: false,
+          error: 'invalid_date_time',
+          hint: 'Erwarte date=YYYY-MM-DD und time=HH:mm (z.B. 15:00)',
+          got: { date: data.date, time: data.time }
+        });
+      }
+      throw e;
+    }
 
     // --- check_availability ---
     if (intent === 'check_availability') {
@@ -583,10 +571,3 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 // -----------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
-
-
-
-
-
-
-
