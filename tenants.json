@@ -13,7 +13,7 @@
     "refresh_env_var": "AZ_REFRESH_DEFAULT"
   }
 }
-  },
+
   {
     "id": "demo-2",
     "disabled": true,
