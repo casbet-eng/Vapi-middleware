@@ -120,27 +120,50 @@ function getTenantByApiKey(key) {
   return TENANTS.find(t => t.api_key && t.api_key === key);
 }
 
+function resolveAzField(t, key) {
+  const az = t.azure || {};
+  const v = az[key];
+
+  // Wenn in tenants.json ein echter Wert steht (und nicht "__ENV__"), nimm ihn direkt
+  if (v && v !== '__ENV__') return v;
+
+  // Fallback: passender ENV-Name anhand des Felds
+  const envMap = {
+    tenant_id: 'AZ_TENANT_ID',
+    client_id: 'AZ_CLIENT_ID',
+    client_secret: 'AZ_CLIENT_SECRET',
+    redirect_uri: 'AZ_REDIRECT_URI'
+  };
+
+  return process.env[envMap[key]];
+}
+
 // Init Azure client per tenant
 async function initAzureForTenant(t) {
-  const az = t.azure || {};
-  if (!az.tenant_id || !az.client_id || !az.client_secret || !az.redirect_uri) {
-    console.warn(`[Azure] Tenant ${t.id} has incomplete Azure config.`);
+  // Felder wahlweise aus tenants.json oder – bei "__ENV__" – aus ENV laden
+  const tenant_id     = resolveAzField(t, 'tenant_id');
+  const client_id     = resolveAzField(t, 'client_id');
+  const client_secret = resolveAzField(t, 'client_secret');
+  const redirect_uri  = resolveAzField(t, 'redirect_uri');
+
+  if (!tenant_id || !client_id || !client_secret || !redirect_uri) {
+    console.warn(`[Azure] Tenant ${t.id} has incomplete Azure config (tenant_id/client_id/client_secret/redirect_uri).`);
     return;
   }
 
-  const issuer = await Issuer.discover(`https://login.microsoftonline.com/${az.tenant_id}/v2.0`);
+  const issuer = await Issuer.discover(`https://login.microsoftonline.com/${tenant_id}/v2.0`);
   const client = new issuer.Client({
-    client_id: az.client_id,
-    client_secret: az.client_secret,
-    redirect_uris: [az.redirect_uri],
+    client_id,
+    client_secret,
+    redirect_uris: [redirect_uri],
     response_types: ['code'],
   });
 
   azureClients.set(t.id, client);
   tenantMeta.set(t.id, {
-    token_file: path.resolve(__dirname, az.token_file || `./tokens/${t.id}.token.json`),
+    token_file: path.resolve(__dirname, (t.azure && t.azure.token_file) || `./tokens/${t.id}.token.json`),
     timezone: t.timezone || 'Europe/Zurich',
-    refresh_env_var: az.refresh_env_var || null
+    refresh_env_var: (t.azure && t.azure.refresh_env_var) || null
   });
 
   console.log(`[Azure] OIDC client initialised for tenant=${t.id}`);
@@ -148,6 +171,10 @@ async function initAzureForTenant(t) {
 
 (async function initAllTenants() {
   for (const t of TENANTS) {
+    if (t.disabled) {
+      console.log(`[TENANTS] skip disabled tenant=${t.id}`);
+      continue;
+    }
     try { await initAzureForTenant(t); }
     catch (e) { console.error(`[Azure] Init error tenant=${t.id}`, e); }
   }
@@ -607,3 +634,4 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware (Multi-Tenant) run
 // -----------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
