@@ -1,0 +1,33 @@
+[
+  {
+    "id": "demo-1",
+    "name": "Demo Agent",
+    "timezone": "Europe/Zurich",
+    "api_key": "sk_demo_1",
+    "calendar": { "provider": "outlook" },
+    "azure": {
+      "tenant_id": "YOUR_AZURE_TENANT_ID",
+      "client_id": "YOUR_AZURE_CLIENT_ID",
+      "client_secret": "__ENV__",              // KEIN echter Wert im Repo
+      "redirect_uri": "https://vapi-middleware.onrender.com/auth/azure/callback",
+      "token_file": "./tokens/demo-1.token.json",
+      "refresh_env_var": "AZ_REFRESH_DEMO1"     // nur der NAME der Env-Var
+    }
+  
+  },
+  {
+    "id": "demo-2",
+    "name": "Demo Kanzlei 2",
+    "timezone": "Europe/Zurich",
+    "api_key": "sk_demo_2",
+    "calendar": { "provider": "outlook" },
+    "azure": {
+      "tenant_id": "YOUR_AZURE_TENANT_ID_2",
+      "client_id": "YOUR_AZURE_CLIENT_ID_2",
+      "client_secret": "YOUR_AZURE_CLIENT_SECRET_2",
+      "redirect_uri": "https://YOURDOMAIN.tld/auth/azure/callback",
+      "token_file": "./tokens/demo-2.token.json",
+      "refresh_env_var": "AZ_REFRESH_DEMO2"
+    }
+  }
+]
