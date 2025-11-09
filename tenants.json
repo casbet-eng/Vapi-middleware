@@ -16,6 +16,7 @@
   },
   {
     "id": "demo-2",
+    "disabled": true,
     "name": "Demo Kanzlei 2",
     "timezone": "Europe/Zurich",
     "api_key": "sk_demo_2",
