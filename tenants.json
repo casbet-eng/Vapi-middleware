@@ -13,20 +13,3 @@
     "refresh_env_var": "AZ_REFRESH_DEFAULT"
   }
 }
-
-  {
-    "id": "demo-2",
-    "disabled": true,
-    "name": "Demo Kanzlei 2",
-    "timezone": "Europe/Zurich",
-    "api_key": "sk_demo_2",
-    "calendar": { "provider": "outlook" },
-    "azure": {
-      "tenant_id": "YOUR_AZURE_TENANT_ID_2",
-      "client_id": "YOUR_AZURE_CLIENT_ID_2",
-      "client_secret": "__ENV__",
-      "redirect_uri": "https://YOURDOMAIN.tld/auth/azure/callback",
-      "token_file": "./tokens/demo-2.token.json",
-      "refresh_env_var": "AZ_REFRESH_DEMO2"
-    }
-  }
