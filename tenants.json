@@ -1,15 +1,17 @@
-{
-  "id": "demo-1",
-  "name": "Demo Agent",
-  "timezone": "Europe/Zurich",
-  "api_key": "sk_demo_1",
-  "calendar": { "provider": "outlook" },
-  "azure": {
-    "tenant_id": "common",
-    "client_id": "__ENV__",
-    "client_secret": "__ENV__",
-    "redirect_uri": "__ENV__",
-    "token_file": "./tokens/demo-1.token.json",
-    "refresh_env_var": "AZ_REFRESH_DEFAULT"
+[
+  {
+    "id": "demo-1",
+    "name": "Demo Agent",
+    "timezone": "Europe/Zurich",
+    "api_key": "sk_demo_1",
+    "calendar": { "provider": "outlook" },
+    "azure": {
+      "tenant_id": "common",
+      "client_id": "__ENV__",
+      "client_secret": "__ENV__",
+      "redirect_uri": "__ENV__",
+      "token_file": "./tokens/demo-1.token.json",
+      "refresh_env_var": "AZ_REFRESH_DEFAULT"
+    }
   }
-}
+]
