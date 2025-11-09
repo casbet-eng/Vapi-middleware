@@ -1,0 +1,5 @@
+# Tokens & lokale Secrets NICHT committen
+tokens/
+token.json
+*.token.json
+.env
