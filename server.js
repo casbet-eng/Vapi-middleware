@@ -457,6 +457,27 @@ app.get('/debug/calendar', async (req, res) => {
   }
 });
 
+app.get('/debug/tenants', (_req, res) => {
+  res.json({
+    loadedFrom: path.join(__dirname, 'tenants.json'),
+    tenants: TENANTS.map(t => ({ id: t.id, disabled: !!t.disabled })),
+    initialisedTenants: {
+      azureClients: Array.from(azureClients.keys()),
+      tenantMeta:   Array.from(tenantMeta.keys())
+    }
+  });
+});
+
+app.get('/debug/env-presence', (_req, res) => {
+  res.json({
+    AZ_TENANT_ID: !!process.env.AZ_TENANT_ID,
+    AZ_CLIENT_ID: !!process.env.AZ_CLIENT_ID,
+    AZ_CLIENT_SECRET: !!process.env.AZ_CLIENT_SECRET,
+    AZ_REDIRECT_URI: !!process.env.AZ_REDIRECT_URI,
+    AZ_REFRESH_DEFAULT: !!process.env.AZ_REFRESH_DEFAULT
+  });
+});
+
 // -----------------------------------------
 // Vapi Webhook (tenant-aware)
 // -----------------------------------------
@@ -634,4 +655,5 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware (Multi-Tenant) run
 // -----------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
