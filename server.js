@@ -1,4 +1,4 @@
-// server.js — Vapi Middleware (Outlook only, robust)
+// server.js — Vapi Middleware (Outlook only) — Multi-Tenant ready
 // Node 18+, node-fetch v2
 
 require('dotenv').config();
@@ -21,15 +21,9 @@ app.set('trust proxy', 1);
 app.use(bodyParser.json());
 
 // -----------------------------------------
-// Settings & files
+// Settings & scopes
 // -----------------------------------------
-const TOKEN_FILE = process.env.TOKENS_PATH
-  ? process.env.TOKENS_PATH
-  : path.join(__dirname, 'token.json'); // Persistenter Tokenstore
-
 const SCOPES = ['offline_access', 'openid', 'profile', 'email', 'Calendars.ReadWrite'];
-
-let azureClient;
 
 // -----------------------------------------
 // Helper: strict secret header (robust + sanitized)
@@ -77,7 +71,7 @@ function requireVapiSecret(req, res, next) {
   const { candidate, sources, raw } = extractIncomingSecret(req);
   const ok = !!candidate && candidate === envSecret;
 
-  // Nur kurze, sichere Logs (keine nicht definierten Helper, keine Klartext-Secrets)
+  // Nur kurze, sichere Logs (keine Klartext-Secrets)
   console.log(
     `[AUTH] eq=${ok} hdr=${hash8(raw.headerRaw)} env=${hash8(envSecret)} src=${JSON.stringify(sources)}`
   );
@@ -104,73 +98,151 @@ app.options('/vapi-webhook', (req, res) => {
 });
 
 // -----------------------------------------
-// Bootstrap: Falls kein token.json -> über ENV refreshen (nach Azure-Init)
+// Multi-Tenant Setup
 // -----------------------------------------
-async function bootstrapTokenFromEnvIfNeeded() {
-  try {
-    const hasTokenFile = fs.existsSync(TOKEN_FILE);
-    if (hasTokenFile) {
-      console.log('[BOOT] token.json vorhanden.');
-      return;
-    }
-
-    const envRefresh = process.env.AZ_REFRESH_DEFAULT;
-    if (!envRefresh) {
-      console.log('[BOOT] Kein token.json und keine AZ_REFRESH_DEFAULT ENV gesetzt.');
-      return;
-    }
-    if (!azureClient) {
-      console.log('[BOOT] azureClient noch nicht initialisiert – Bootstrap wird übersprungen.');
-      return;
-    }
-
-    console.log('[BOOT] Kein token.json, refreshe über ENV…');
-    const refreshed = await azureClient.refresh(envRefresh);
-    fs.writeFileSync(TOKEN_FILE, JSON.stringify(refreshed, null, 2));
-    console.log('[BOOT] token.json aus ENV-Refresh erstellt.');
-  } catch (e) {
-    console.error('[BOOT] Fehler beim Laden/Refresh aus ENV:', e);
-  }
+let TENANTS = [];
+const tenantsPath = path.join(__dirname, 'tenants.json');
+try {
+  TENANTS = JSON.parse(fs.readFileSync(tenantsPath, 'utf8'));
+  console.log('[TENANTS] loaded:', TENANTS.map(t => t.id));
+} catch (e) {
+  console.warn('[TENANTS] tenants.json not found or invalid. Create one next to server.js');
+  TENANTS = [];
 }
 
-// -----------------------------------------
-// Init Azure OpenID Client (ruft Bootstrap NACH Init)
-// -----------------------------------------
-(async function initAzure() {
-  try {
-    if (!process.env.AZ_TENANT_ID || !process.env.AZ_CLIENT_ID || !process.env.AZ_CLIENT_SECRET || !process.env.AZ_REDIRECT_URI) {
-      console.warn('Azure ENV Variablen fehlen. Setze AZ_TENANT_ID, AZ_CLIENT_ID, AZ_CLIENT_SECRET, AZ_REDIRECT_URI');
-      return;
-    }
+const azureClients = new Map(); // tenantId -> openid-client Client
+const tenantMeta   = new Map(); // tenantId -> { token_file, timezone, refresh_env_var }
 
-    const issuer = await Issuer.discover(`https://login.microsoftonline.com/${process.env.AZ_TENANT_ID}/v2.0`);
-    azureClient = new issuer.Client({
-      client_id: process.env.AZ_CLIENT_ID,
-      client_secret: process.env.AZ_CLIENT_SECRET,
-      redirect_uris: [process.env.AZ_REDIRECT_URI],
-      response_types: ['code'],
-    });
-    console.log('Azure OIDC client initialisiert.');
+function getTenantById(id) {
+  return TENANTS.find(t => t.id === id);
+}
+function getTenantByApiKey(key) {
+  return TENANTS.find(t => t.api_key && t.api_key === key);
+}
 
-    await bootstrapTokenFromEnvIfNeeded();
-  } catch (e) {
-    console.error('Azure init error', e);
+// Init Azure client per tenant
+async function initAzureForTenant(t) {
+  const az = t.azure || {};
+  if (!az.tenant_id || !az.client_id || !az.client_secret || !az.redirect_uri) {
+    console.warn(`[Azure] Tenant ${t.id} has incomplete Azure config.`);
+    return;
+  }
+
+  const issuer = await Issuer.discover(`https://login.microsoftonline.com/${az.tenant_id}/v2.0`);
+  const client = new issuer.Client({
+    client_id: az.client_id,
+    client_secret: az.client_secret,
+    redirect_uris: [az.redirect_uri],
+    response_types: ['code'],
+  });
+
+  azureClients.set(t.id, client);
+  tenantMeta.set(t.id, {
+    token_file: path.resolve(__dirname, az.token_file || `./tokens/${t.id}.token.json`),
+    timezone: t.timezone || 'Europe/Zurich',
+    refresh_env_var: az.refresh_env_var || null
+  });
+
+  console.log(`[Azure] OIDC client initialised for tenant=${t.id}`);
+}
+
+(async function initAllTenants() {
+  for (const t of TENANTS) {
+    try { await initAzureForTenant(t); }
+    catch (e) { console.error(`[Azure] Init error tenant=${t.id}`, e); }
   }
 })();
 
+// Token helpers per tenant
+async function bootstrapTokenFromEnvIfNeeded(tenantId) {
+  const meta = tenantMeta.get(tenantId);
+  const client = azureClients.get(tenantId);
+  if (!meta || !client) return;
+
+  if (fs.existsSync(meta.token_file)) return;
+
+  const envVarName = meta.refresh_env_var;
+  const envRefresh = envVarName ? process.env[envVarName] : null;
+  if (!envRefresh) return;
+
+  console.log(`[BOOT][${tenantId}] No token file, refreshing via ENV ${envVarName}…`);
+  const refreshed = await client.refresh(envRefresh);
+  fs.mkdirSync(path.dirname(meta.token_file), { recursive: true });
+  fs.writeFileSync(meta.token_file, JSON.stringify(refreshed, null, 2));
+  console.log(`[BOOT][${tenantId}] Token saved from ENV refresh.`);
+}
+
+async function ensureAzureAccessTokenForTenant(tenantId) {
+  const client = azureClients.get(tenantId);
+  const meta   = tenantMeta.get(tenantId);
+  if (!client || !meta) throw new Error(`Azure Client not initialised for tenant=${tenantId}`);
+
+  if (!fs.existsSync(meta.token_file)) {
+    await bootstrapTokenFromEnvIfNeeded(tenantId);
+  }
+
+  let t = null;
+  if (fs.existsSync(meta.token_file)) {
+    try { t = JSON.parse(fs.readFileSync(meta.token_file, 'utf8')); }
+    catch (e) { console.error(`[Token][${tenantId}] read failed:`, e); }
+  }
+
+  if (!t || !t.access_token) {
+    throw new Error(`No Outlook token for tenant=${tenantId}`);
+  }
+
+  const now = Math.floor(Date.now()/1000);
+  const exp = t.expires_at || (now + 60);
+  if ((exp - now) < 300 && t.refresh_token) {
+    console.log(`[Token][${tenantId}] expiring soon, refreshing…`);
+    const refreshed = await client.refresh(t.refresh_token);
+    fs.writeFileSync(meta.token_file, JSON.stringify(refreshed, null, 2));
+    return refreshed.access_token;
+  }
+
+  return t.access_token;
+}
+
 // -----------------------------------------
-// OAuth Flows
+// Tenant Context Resolver (Header X-Api-Key bevorzugt, sonst body/query tenant_id)
 // -----------------------------------------
-app.get('/auth/azure', async (_req, res) => {
+app.use((req, res, next) => {
+  const apiKey = req.get('X-Api-Key') || req.get('x-api-key');
+  let tenant = apiKey ? getTenantByApiKey(apiKey) : null;
+
+  if (!tenant) {
+    const bodyTenantId = req.body?.tenant_id || req.query?.tenant_id;
+    if (bodyTenantId) tenant = getTenantById(bodyTenantId);
+  }
+
+  if (tenant) {
+    req.tenant = {
+      id: tenant.id,
+      timezone: tenant.timezone || 'Europe/Zurich',
+      provider: tenant.calendar?.provider || 'outlook'
+    };
+  }
+  next();
+});
+
+// -----------------------------------------
+// OAuth Flows (per tenant)
+// -----------------------------------------
+app.get('/auth/azure', async (req, res) => {
   try {
-    if (!azureClient) return res.status(500).send('Azure nicht konfiguriert.');
-    const state = 'default';
-    const url = azureClient.authorizationUrl({
+    const tenantId = req.query.tenant_id;
+    if (!tenantId) return res.status(400).send('tenant_id required');
+    const client = azureClients.get(tenantId);
+    const t = getTenantById(tenantId);
+    if (!client || !t) return res.status(500).send('Tenant/Azure not configured.');
+
+    const state = tenantId; // wichtig: state=tenant
+    const url = client.authorizationUrl({
       scope: SCOPES.join(' '),
       response_mode: 'query',
       state
     });
-    console.log('[OAUTH] auth start -> state:', state);
+    console.log('[OAUTH] start tenant=', tenantId);
     res.redirect(url);
   } catch (e) {
     console.error('Auth start error', e);
@@ -180,76 +252,32 @@ app.get('/auth/azure', async (_req, res) => {
 
 app.get('/auth/azure/callback', async (req, res) => {
   try {
-    if (!azureClient) return res.status(500).send('Azure nicht konfiguriert.');
-    const params = azureClient.callbackParams(req);
-    const state = params.state || 'default';
-    console.log('[OAUTH] callback state:', state);
+    // Microsoft liefert GET-Query-Params zurück
+    const tenantId = req.query.state;
+    const client = azureClients.get(tenantId);
+    const t = getTenantById(tenantId);
+    if (!tenantId || !client || !t) return res.status(400).send('Invalid state/tenant');
 
-    const tokenSet = await azureClient.callback(
-      process.env.AZ_REDIRECT_URI,
+    // openid-client akzeptiert die query-params als "params"
+    const params = req.query;
+
+    const tokenSet = await client.callback(
+      t.azure.redirect_uri,
       params,
-      { state }
+      { state: tenantId }
     );
 
-    console.log('[OAUTH] tokenSet:', {
-      hasAccess: !!tokenSet.access_token,
-      hasRefresh: !!tokenSet.refresh_token,
-      scope: tokenSet.scope
-    });
+    const meta = tenantMeta.get(tenantId);
+    fs.mkdirSync(path.dirname(meta.token_file), { recursive: true });
+    fs.writeFileSync(meta.token_file, JSON.stringify(tokenSet, null, 2));
+    console.log('[OAUTH] token saved for tenant=', tenantId, 'file=', meta.token_file);
 
-    try {
-      fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokenSet, null, 2));
-      console.log('[OAUTH] tokenSet gespeichert -> token.json');
-      console.log('[OAUTH] REFRESH_TOKEN_FOR_ENV=', tokenSet.refresh_token || '(none)');
-    } catch (e) {
-      console.error('Konnte token.json nicht schreiben:', e);
-    }
-
-    res.send('Microsoft Outlook verbunden. Du kannst dieses Fenster schliessen.');
+    res.send(`Microsoft Outlook verbunden für Tenant ${tenantId}. Du kannst dieses Fenster schliessen.`);
   } catch (e) {
     console.error('Azure callback error', e);
     res.status(500).send('Azure callback error');
   }
 });
-
-// -----------------------------------------
-// Token sicherstellen (liest token.json, refresht bei Bedarf, Bootstrap via ENV)
-// -----------------------------------------
-async function ensureAzureAccessToken() {
-  if (!azureClient) throw new Error('Azure Client nicht initialisiert');
-
-  let t = null;
-
-  if (fs.existsSync(TOKEN_FILE)) {
-    try {
-      t = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
-    } catch (e) {
-      console.error('token.json lesen fehlgeschlagen:', e);
-    }
-  }
-
-  if (!t && process.env.AZ_REFRESH_DEFAULT) {
-    console.log('[ensureToken] Kein token.json, refreshe über ENV…');
-    const refreshed = await azureClient.refresh(process.env.AZ_REFRESH_DEFAULT);
-    fs.writeFileSync(TOKEN_FILE, JSON.stringify(refreshed, null, 2));
-    t = refreshed;
-  }
-
-  if (!t || !t.access_token) {
-    throw new Error('Kein Outlook-Konto verbunden');
-  }
-
-  const now = Math.floor(Date.now() / 1000);
-  const exp = t.expires_at || (now + 60);
-  if ((exp - now) < 300 && t.refresh_token) {
-    console.log('[ensureToken] Token läuft bald ab, refreshe…');
-    const refreshed = await azureClient.refresh(t.refresh_token);
-    fs.writeFileSync(TOKEN_FILE, JSON.stringify(refreshed, null, 2));
-    return refreshed.access_token;
-  }
-
-  return t.access_token;
-}
 
 // -----------------------------------------
 // Helpers (Normalisierung von Datum/Zeit)
@@ -313,24 +341,29 @@ function parseTimeslot(dateStr, timeStr, durationMin = 30) {
 }
 
 // -----------------------------------------
-// Debug Routes
+// Debug Routes (tenant-aware)
 // -----------------------------------------
-app.get('/debug/status', (_req, res) => {
+app.get('/debug/status', (req, res) => {
   try {
-    if (!fs.existsSync(TOKEN_FILE)) {
-      return res.json({
-        ok: true,
-        hasTokenFile: false,
-        hasAZ_REFRESH_DEFAULT: !!process.env.AZ_REFRESH_DEFAULT
-      });
+    const tenantId = req.query.tenant_id;
+    if (!tenantId) {
+      return res.json({ ok: true, tenants: TENANTS.map(t => t.id) });
     }
-    const t = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
+    const meta = tenantMeta.get(tenantId);
+    if (!meta) return res.status(404).json({ ok: false, error: 'TENANT_UNKNOWN' });
+
+    const exists = fs.existsSync(meta.token_file);
+    let t = null;
+    if (exists) {
+      try { t = JSON.parse(fs.readFileSync(meta.token_file, 'utf8')); } catch {}
+    }
     res.json({
       ok: true,
-      hasTokenFile: true,
-      expires_at: t.expires_at,
-      hasRefresh: !!t.refresh_token,
-      scope: t.scope
+      tenant: tenantId,
+      hasTokenFile: exists,
+      expires_at: t?.expires_at,
+      hasRefresh: !!t?.refresh_token,
+      scope: t?.scope
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -352,9 +385,12 @@ app.get('/debug/secret', (req, res) => {
   });
 });
 
-app.get('/debug/me', async (_req, res) => {
+app.get('/debug/me', async (req, res) => {
   try {
-    const token = await ensureAzureAccessToken();
+    const tenantId = req.query.tenant_id || req.tenant?.id;
+    if (!tenantId) return res.status(400).json({ ok: false, error: 'TENANT_REQUIRED' });
+
+    const token = await ensureAzureAccessTokenForTenant(tenantId);
     const r = await fetch('https://graph.microsoft.com/v1.0/me', {
       headers: { Authorization: `Bearer ${token}` }
     });
@@ -367,9 +403,13 @@ app.get('/debug/me', async (_req, res) => {
 
 app.get('/debug/calendar', async (req, res) => {
   try {
-    const { date, time, dur = 30, timezone = 'Europe/Zurich' } = req.query;
+    const tenantId = req.query.tenant_id || req.tenant?.id;
+    if (!tenantId) return res.status(400).json({ ok: false, error: 'TENANT_REQUIRED' });
+
+    const { date, time, dur = 30, timezone } = req.query;
     const { start, end } = parseTimeslot(date, time, Number(dur));
-    const token = await ensureAzureAccessToken();
+    const token = await ensureAzureAccessTokenForTenant(tenantId);
+    const tz = timezone || tenantMeta.get(tenantId)?.timezone || 'Europe/Zurich';
 
     const q = `https://graph.microsoft.com/v1.0/me/calendarView` +
               `?startDateTime=${encodeURIComponent(start.toISOString())}` +
@@ -380,7 +420,7 @@ app.get('/debug/calendar', async (req, res) => {
       headers: {
         Authorization: `Bearer ${token}`,
         Accept: 'application/json',
-        Prefer: `outlook.timezone="${timezone}"`
+        Prefer: `outlook.timezone="${tz}"`
       }
     });
     const body = await r.json();
@@ -391,10 +431,14 @@ app.get('/debug/calendar', async (req, res) => {
 });
 
 // -----------------------------------------
-// Vapi Webhook
+// Vapi Webhook (tenant-aware)
 // -----------------------------------------
 app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
   try {
+    if (!req.tenant) {
+      return res.status(400).json({ ok: false, error: 'TENANT_REQUIRED' });
+    }
+
     // 1) Intent ermitteln (Header/Body)
     let intent =
       req.body?.intent ||
@@ -426,7 +470,7 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
 
     if (!intent) intent = 'check_availability';
 
-    const timezone = data.timezone || 'Europe/Zurich';
+    const timezone = data.timezone || req.tenant.timezone || 'Europe/Zurich';
     const duration = Number(data.durationMinutes || 30);
 
     // Pflichtfelder
@@ -441,9 +485,9 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
       });
     }
 
-    console.log('[WEBHOOK] tool-call intent:', intent, 'keys:', Object.keys(data || {}));
+    console.log('[WEBHOOK] tool-call intent:', intent, 'tenant:', req.tenant.id, 'keys:', Object.keys(data || {}));
 
-    const token = await ensureAzureAccessToken();
+    const token = await ensureAzureAccessTokenForTenant(req.tenant.id);
 
     let start, end, startISO, endISO;
     try {
@@ -545,7 +589,7 @@ app.post('/vapi-webhook', requireVapiSecret, async (req, res) => {
 // -----------------------------------------
 // Health & Route Listing
 // -----------------------------------------
-app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
+app.get('/', (_req, res) => res.send('Vapi Outlook Middleware (Multi-Tenant) running'));
 
 (function logRoutes(app) {
   const routes = [];
@@ -563,7 +607,3 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware running'));
 // -----------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
-
-
-
-
