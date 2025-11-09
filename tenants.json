@@ -6,14 +6,13 @@
     "api_key": "sk_demo_1",
     "calendar": { "provider": "outlook" },
     "azure": {
-      "tenant_id": "YOUR_AZURE_TENANT_ID",
-      "client_id": "YOUR_AZURE_CLIENT_ID",
-      "client_secret": "__ENV__",              // KEIN echter Wert im Repo
+      "tenant_id": "common",
+      "client_id": "9192779b-fba5-41db-b4bb-50c22a9fc82f",
+      "client_secret": "__ENV__",
       "redirect_uri": "https://vapi-middleware.onrender.com/auth/azure/callback",
       "token_file": "./tokens/demo-1.token.json",
-      "refresh_env_var": "AZ_REFRESH_DEMO1"     // nur der NAME der Env-Var
+      "refresh_env_var": "AZ_REFRESH_DEFAULT"
     }
-  
   },
   {
     "id": "demo-2",
@@ -24,7 +23,7 @@
     "azure": {
       "tenant_id": "YOUR_AZURE_TENANT_ID_2",
       "client_id": "YOUR_AZURE_CLIENT_ID_2",
-      "client_secret": "YOUR_AZURE_CLIENT_SECRET_2",
+      "client_secret": "__ENV__",
       "redirect_uri": "https://YOURDOMAIN.tld/auth/azure/callback",
       "token_file": "./tokens/demo-2.token.json",
       "refresh_env_var": "AZ_REFRESH_DEMO2"
