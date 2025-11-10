@@ -279,30 +279,49 @@ app.get('/auth/azure', async (req, res) => {
 
 app.get('/auth/azure/callback', async (req, res) => {
   try {
-    // Microsoft liefert GET-Query-Params zurück
-    const tenantId = req.query.state;
+    // 1) Params sicher aus Request extrahieren (GET/POST kompatibel)
+    //    -> nutzt openid-client Helper
+    const paramsFromAny = (() => {
+      try {
+        // Wir haben mehrere Tenants, nehmen daher irgendeinen Client zum Params-Parsen
+        const anyClient = azureClients.values().next().value;
+        return anyClient ? anyClient.callbackParams(req) : req.query;
+      } catch {
+        return req.query;
+      }
+    })();
+
+    const tenantId = paramsFromAny.state || req.query.state;
+    if (!tenantId) throw new Error('Missing state/tenant_id in callback');
+
     const client = azureClients.get(tenantId);
     const t = getTenantById(tenantId);
-    if (!tenantId || !client || !t) return res.status(400).send('Invalid state/tenant');
+    if (!client || !t) throw new Error(`Tenant/Azure not configured for ${tenantId}`);
 
-    // openid-client akzeptiert die query-params als "params"
-    const params = req.query;
+    // 2) Logs für Diagnose (keine Geheimnisse)
+    console.log('[OAUTH][cb] tenant=', tenantId, 'params keys=', Object.keys(paramsFromAny || {}));
 
+    // 3) Callback verifizieren & Token holen
     const tokenSet = await client.callback(
-      t.azure.redirect_uri,
-      params,
+      resolveAzField(t, 'redirect_uri'),
+      paramsFromAny,
       { state: tenantId }
     );
 
     const meta = tenantMeta.get(tenantId);
     fs.mkdirSync(path.dirname(meta.token_file), { recursive: true });
     fs.writeFileSync(meta.token_file, JSON.stringify(tokenSet, null, 2));
-    console.log('[OAUTH] token saved for tenant=', tenantId, 'file=', meta.token_file);
+    console.log('[OAUTH][cb] token saved for tenant=', tenantId, 'file=', meta.token_file);
 
     res.send(`Microsoft Outlook verbunden für Tenant ${tenantId}. Du kannst dieses Fenster schliessen.`);
   } catch (e) {
-    console.error('Azure callback error', e);
-    res.status(500).send('Azure callback error');
+    // → Mehr Details loggen, inkl. Azure-Fehlertext falls vorhanden
+    console.error('[OAUTH][cb] error:', e?.message || e);
+    if (e?.response?.body) {
+      try { console.error('[OAUTH][cb] body:', await e.response.body.text()); } catch {}
+    }
+    // Nutzerfreundliche Antwort
+    res.status(500).send(`Azure callback error: ${e?.message || e}`);
   }
 });
 
@@ -655,5 +674,6 @@ app.get('/', (_req, res) => res.send('Vapi Outlook Middleware (Multi-Tenant) run
 // -----------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Server listening on', PORT));
+
 
 
